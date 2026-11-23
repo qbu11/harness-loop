@@ -1,104 +1,93 @@
-# 多 Harness 互调网与动态角色路由手册（内置 AGY ↔ Claude Code ↔ Codex）
+# 多 Harness 互调网、Tmux 并发路由与工程边界手册
 
-> 无论你当前正处于 **Antigravity（AGY）**、**Claude Code（`claude`）**、**Codex（`codex`）** 或后续接入的新 Harness，均可通过 `loopctl.py` 在任意中间环节向其他任意一端**取经评审（只读 `consult`）**、**下达修改与执行任务（`delegate`）**、或**查阅对方的实时会话进度与历史上下文（`inspect`）**，全部记录自动汇总进同一份 `<repo>/.agent-loop/LATEST.md`。
+> 本文档说明跨端调用矩阵（`consult` / `delegate` / `inspect`）、Tmux 全会话可视化布局、按赛道花名册路由及真实 CLI 边界。
 
 ---
 
-## 1. 3×3 互调能力矩阵（内置后端；新 Harness 可插拔扩展）
+## 1. 跨端互调矩阵（内置 AGY ↔ Claude Code ↔ Codex；新 Harness 可插拔）
 
-| 当前发起方 | 向谁求助/派活 | 获取只读评审/改进意见（`consult`） | 指挥修改与执行（`delegate`） | 查询对方进度与日志（`inspect`） |
+| 发起方 | 目标端 | 只读评审（`consult`） | 派活写码（`delegate`） | 实时进度（`inspect`） |
 |---|---|---|---|---|
-| **任意端**（`agy`/`claude`/`codex`） | **→ Antigravity (`agy`)** | `agy -p --mode plan --output-format json [--model <m>] [--conversation <id>] "<问题>"` | `agy -p --mode accept-edits --output-format json [--model <m>] [--conversation <id>] "<任务>"` | `loopctl.py inspect --harness agy --agy-id <id> --last 6 --json` |
-| **任意端**（`agy`/`claude`/`codex`） | **→ Claude Code (`claude`)** | `claude -p --permission-mode plan --output-format json [--model <m>] [--resume <sid>] "<问题>"` | `claude --bg -n "<名>" [--model <m>] "<任务>"`（复杂需求自动加 `ultracode`） | `loopctl.py inspect --harness claude --repo "<repo>" --tail-turns 5 --json` |
-| **任意端**（`agy`/`claude`/`codex`） | **→ Codex (`codex`)** | `codex exec -C "<repo>" -s read-only --json -o <reply.md> [-m <m>] "<问题>"` | `codex exec -C "<repo>" -s workspace-write --json -o <last.md> [-m <m>] "<任务>"` | `loopctl.py inspect --harness codex --repo "<repo>" --tail-turns 5 --json` |
+| 任意端 | **Antigravity (`agy`)** | `agy -p --mode plan --output-format json [--model <m>]` | `agy -p --mode accept-edits --output-format json [--model <m>]` | `inspect --harness agy --agy-id <id>` |
+| 任意端 | **Claude Code (`claude`)** | `claude -p --permission-mode plan --output-format json [--model <m>]` | `claude --bg -n <名>`（自动进 tmux 窗执行 `claude attach`） | `inspect --harness claude --workdir <wt>` |
+| 任意端 | **Codex (`codex`)** | `codex exec -C <workdir> -s read-only --json -o <reply.md> [-m <m>]` | `codex exec -C <workdir> -s workspace-write --json -o <last.md> [-m <m>]` | `inspect --harness codex --workdir <wt> [--job-id <id>]` |
 
-> **不要手拼参数**：统一调用 `loopctl.py consult` 与 `loopctl.py delegate`，脚本会自动：
-> 1. 根据 `manifest.roster` 解析显式指定的模型（或省略参数以继承目标 Harness 全局默认）；
-> 2. 注入 `HARNESS_LOOP_DEPTH`（同时兼容旧环境变量 `AGY_LOOP_DEPTH`）防无限互相嵌套（默认限制深度 `< 2`）；
-> 3. 检查同仓库活跃写任务（避免两个执行端同时改同一份代码）；
-> 4. 将去程提问/任务与回程意见/交付正文全部写入 `<repo>/.agent-loop/LATEST.md` 与 `events.jsonl`。
+**`loopctl.py` 自动执行的护栏与记账**：
+1. 注入 `HARNESS_LOOP_DEPTH`（兼容旧变量 `AGY_LOOP_DEPTH`），默认限制嵌套 `< 2`；
+2. 写冲突检查按 **目标 `workdir` 精确隔离**：不同 `git worktree` 可并发派活，同一工作目录禁止双写；
+3. `fcntl.flock` + 原子写保障并发更新 `manifest.json` 与 `LATEST.md` 不丢记录；
+4. 所有 `consult` / `delegate` / `delivery` / `audit` 全量留痕进 `<repo>/.agent-loop/<run-id>/DIALOGUE.md`。
 
 ---
 
-## 2. 本机模型别名与继承规则
+## 2. Tmux 全会话实时看板
 
-> **核心纪律**：只要用户没有在本轮明确要求换模型，调用另外两个 Harness 时**不传 `--model` / `-m`**，一律沿用目标 Harness 自己的全局默认配置；也**禁止跨 Harness 传递认证或 Provider 环境变量**。
+只要本机已安装 `tmux`，`delegate` 与 `consult` 默认自动在会话 **`hl-<slug>`** 中分配命名窗口运行（需临时关闭时传 `--no-tmux`）：
+- **Window 0 (`dashboard`)**：自动刷新全波任务总览表（窗口号、状态、Wave、Harness/模型、耗时、最近活跃时间、Workdir/分支）。
+- **Worker 窗口 (`1..N`)**：
+  - Codex / AGY：内部通过 `_run-job` 流式解码打印思考摘要、执行命令、修改文件与最终回复，原始 JSONL 同步无损落盘并原子写入 `.exit.json`；
+  - Claude Code：`--bg` 启动隔离后台任务，同时在 tmux 窗内运行 `claude attach <bg-id>` 实时呈现原生交互界面。
 
-当用户明确点名角色模型（例如「这次用 Codex 的 **GPT-6.2-Sol** / **Codex GPT 6.2 Sol** 跑开发」）时，可通过 `init` 或 `set-roster` 绑定，`loopctl.py` 会自动把常见简称规范化为真实 CLI 模型 slug：
+| 命令 | 用途 |
+|---|---|
+| `loopctl.py tmux attach --repo <repo> [--job-id <id>]` | 一键接入或切换到对应 tmux 会话/窗口 |
+| `loopctl.py tmux status --repo <repo> [--json]` | 打印当前所有任务窗口实时状态表 |
+| `loopctl.py tmux tail --repo <repo> [--job-id <id>] [--lines 40]` | 不进 tmux 直接抓取某窗口末尾 40 行画面 |
+| `loopctl.py tmux stop --repo <repo> (--job-id <id> \| --all)` | 安全关闭指定窗口或整组会话 |
 
-| Harness | 用户常说 | 真实 CLI 模型 slug（已核实） | 常见分工建议 |
-|---|---|---|---|
-| **Codex** | `GPT-6.2-Sol` / `Codex GPT 6.2 Sol` / `6.2-sol` | **`gpt-6.2-sol`** | 主力开发执行（`executor`）、复杂 bug 根治（需 Codex CLI `>= 0.171.0` 且账号已开放） |
-| **Codex** | `GPT 6.2 Astra` / `6.2-astra` | `gpt-6.2-astra` | 高推理深度审查/设计 |
-| **Codex** | `GPT-6.1-Sol` / `Codex GPT 6.1 Sol` / `gpt-6.1-sol` | `gpt-6.1-sol` | 备选 Sol 开发执行 |
-| **Codex** | `GPT-6-Astra` / `GPT-6-Sol` | `gpt-6-astra` / `gpt-6-sol` | 常用全局默认 / 通用执行 |
-| **Codex** | `Codex Auto Review` | `codex-auto-review` | 独立代码审校（`verifier` / `advisor`） |
-| **Antigravity** | `Gemini 4 Neon XHigh` / `Orchestrator Neon` | `gemini-4-neon-xhigh` / `gemini-pro-orchestrator-neon` | 架构规划、Spec 编写、独立终审 |
-| **Antigravity** | `Claude Opus 5.5 High` | `claude-opus-5-5-high` | 交互审查、文档撰稿 |
-| **Claude Code** | `opus` / `sonnet` | 透传 `claude` 原生别名 | `ultracode` 多阶段施工或架构评审 |
+> **全局配置零侵入**：仅对该 `hl-<slug>` 会话局部设置 `mouse on`、`remain-on-exit on`、`allow-rename off`，不写 `~/.tmux.conf`。
 
-> **实测防踩坑提示**：若显式指定的模型在当前账号/CLI 版本不可用（例如旧版 Codex CLI 返回 `400 model_not_found`），`loopctl.py` 会在非零退出时报错并拒绝绑定失败会话，**绝不静默偷换模型**；升级客户端或经用户确认改派模型（或去掉 `--model` 继承全局默认）后再重跑。
+---
 
-### 动态调整角色花名册示例
+## 3. 按赛道花名册（`--track`）与多 Worktree 并发
+
+当项目前后端、不同波次使用不同模型或 Harness 时，用 `--track` 绑定赛道（未指定 `--model` 时默认继承目标 CLI 全局配置，禁止跨端透传认证环境变量）：
+
 ```bash
-# 开局指定：AGY 当架构师+终审，Codex (GPT-6.2-Sol) 当执行官
-python3 "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" init \
+# 1. 初始化闭环并声明各赛道默认分工
+python3 -B "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" init \
   --repo "<repo>" --slug "<slug>" --agy-id "<agy-id>" \
-  --architect agy --executor "codex:GPT-6.2-Sol" --verifier agy --json
+  --track backend_claude=claude --track backend_codex=codex:GPT-6.2-Sol \
+  --track frontend=claude --json
 
-# 中途把终审改派给 Codex Auto Review，或加设 Claude 为顾问
-python3 "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" set-roster \
-  --repo "<repo>" --verifier "codex:codex-auto-review" --advisor claude --json
-```
+# 2. 在两个隔离 Git Worktree 中并波派活（自动进入 tmux 分窗 + 看板）
+python3 -B "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" delegate \
+  --repo "<repo>" --workdir "<wt-1a>" --wave "wave1" --track backend_claude \
+  --label "w1a-files" --from agy --prompt-file "<p1a.md>" --json
 
----
+python3 -B "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" delegate \
+  --repo "<repo>" --workdir "<wt-1b>" --wave "wave1" --track backend_codex \
+  --label "w1b-outline" --from agy --prompt-file "<p1b.md>" --json
 
-## 3. 中间环节跨端求助与指挥示例
-
-### 场景 A：Codex（如 `gpt-6.2-sol`）执行到一半拿不准架构/产品口径 → 向 AGY 只读咨询
-```bash
-python3 "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" consult \
-  --repo "<repo>" --from codex --to agy \
-  --summary "核对接口返回结构是否符合 PRD" \
-  --prompt "请只读检查 docs/PRD-xxx.md 与我当前 git diff，确认分页字段命名是否需要保留旧字段兼容。" --json
-```
-
-### 场景 B：Claude Code 或 AGY 想在提交前让 GPT-6.2-Sol / Codex Auto Review 做一次对抗性审校
-```bash
-python3 "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" consult \
-  --repo "<repo>" --from claude --to codex --model "Codex GPT 6.2 Sol" \
-  --summary "请 GPT-6.2-Sol 审校未提交 diff" \
-  --prompt "只读审阅当前工作区 git diff 与主要风险点，给出按文件:行号排序的问题清单，不要修改文件。" --json
-```
-
-### 场景 C：AGY 终审 `NEEDS_FIX` 后指挥 Codex（`gpt-6.2-sol`）按返工单修代码
-```bash
-python3 "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" delegate \
-  --repo "<repo>" --from agy --to codex --role-name executor --model "GPT-6.2-Sol" \
-  --prompt-file "<repo>/.agent-loop/<run-id>/ROUND-1-PROMPT.md" \
-  --summary "第 1 轮返工交由 Codex GPT-6.2-Sol 修复" --background --json
-```
-随后使用零 Token 本地状态监测等待交卷并自动同步回台账（依赖 AGY 原生后台任务回调精准唤醒当前会话，零全局 Hook 污染）：
-```bash
+# 3. 零 Token 守候整波全部完成
 python3 -B "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" watch \
-  --repo "<repo>" --harness codex --stall-timeout 600 --timeout 7200 --json
+  --repo "<repo>" --wave "wave1" --stall-timeout 600 --json
 ```
-监测脚本四合一判据：**终态事件**（Codex `task_complete`/`turn_aborted`，Claude `end_turn`/`StopFailure`）+ **进程与官方状态**（PID 存活、`ps -o stat=` 识别僵尸进程、`claude agents --all --json`）+ **活跃度跟踪**（日志增长、Git 变更、子进程运行）+ **长静默卡死阈值**（`--stall-timeout`，默认 600s；彻底静默卡死以 exit `2` (`STALLED`) 唤醒 AGY 介入，异常崩溃以 exit `1` (`PROCESS_EXITED_FAILED`) 返回尾部诊断）。
 
-### 实测工程注意事项与终端直达回看
-- **Codex `workspace-write` `.git/index.lock` 沙箱边界**：在 macOS 上以 `-s workspace-write` 派发 Codex 时，`.git/` 受写保护（`git add` 建 `.git/index.lock` 会被拒绝）。在提示词中告知执行端「若 `.git` 受限，则保留通过测试的工作区改动并如实汇报」，切勿引导绕过沙箱；需要由 Codex 自动 commit 时改用 `--sandbox danger-full-access`。
-- **终端一行直达双端对话**：
-  - Codex 原生 TUI 续接必须带目录切换：`cd "<repo>" && codex resume <session_id>`（否则按 CWD 过滤会找不到会话）。
-  - Antigravity Desktop 会话（`~/.gemini/antigravity/brain/`）与 `agy` CLI 会话（`~/.gemini/antigravity-cli/brain/`）分库存储，`agy --conversation <id>` 仅认 CLI 库；在终端统一回看推荐 `python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py view --repo "<repo>"`（或 `--agy-id <id>`）。
+### 本机常用模型别名（显式指定时可用）
+
+| Harness | 常见简称 | 真实 CLI slug | 说明 |
+|---|---|---|---|
+| **Codex** | `GPT-6.2-Sol` / `6.2-sol` | `gpt-6.2-sol` | 复杂后端实现、对抗性代码审校 |
+| **Codex** | `GPT-6.2-Astra` / `GPT-6-Astra` | `gpt-6.2-astra` / `gpt-6-astra` | 高推理深度设计/审校 |
+| **Codex** | `Codex Auto Review` | `codex-auto-review` | 独立只读审校 |
+| **Antigravity** | `Gemini 4 Neon XHigh` / `Claude Opus 5.5 High` | `gemini-4-neon-xhigh` / `claude-opus-5-5-high` | 架构、文档包、终审 |
+| **Claude Code** | `opus` / `sonnet` | 原生透传 | 配合 `ultracode` 跑多阶段工作流 |
+
+> 显式指定的模型若在目标客户端不可用，CLI 返回非零时 `loopctl.py` 立即报错并拒绝绑定会话，不静默替换模型。
 
 ---
 
-## 4. 开源社区与本机已有复用清单（不重复造轮子）
+## 4. 实测命令行与沙箱边界提示
 
-1. **已直接复用的本机能力**：
-   - **Codex 复杂并行任务**：当 Codex 作为执行官需要并行拆解多模块/多文件流水线时，直接调用本机已安装的 [`codex-workflows`](~/.agents/skills/codex-workflows/SKILL.md)（App Server JavaScript Workflow Runner + `workspace` / `parallel` / `pipeline`），不在 `loopctl.py` 内重写第二套 Codex 调度器。
-   - **Claude Code 复杂多阶段任务**：直接激活 Claude Code 原生 **`ultracode`** 关键字钩子与内置 `Workflow` 工具。
-   - **Antigravity 浏览器体验与定时巡检**：直接复用 AGY 原生 `browser` 子代理与 `schedule` 工具。
-2. **开源社区调研评估结论**：
-   - **`openai/codex-plugin-cc`（⭐ 35.3k）**：OpenAI 官方 Claude Code 插件（`/codex:review`、`/codex:adversarial-review`、`/codex:rescue`）。若用户在 Claude Code 内想一键调起 Codex 对抗评审可随时安装作为快捷入口，但它仅覆盖 Claude → Codex 单向，仍需由 `harness-loop` 承担 AGY ↔ CC ↔ Codex 三端总编排与统一可追溯台账。
-   - **`openclaw/acpx`（⭐ 3.4k）**：ACP 无头多代理客户端。因其 `acpx antigravity` 需额外配置 `agy_acp_server.par` OAuth 且 `acpx claude` 会屏蔽用户全局设置并把日志隔离在 `~/.acpx/sessions/`，本链路继续优先直接调用三端本机原生 CLI，保留完整的本地会话可读性与 `claude attach` / `codex resume` 接管体验；仅当未来要接入 30+ 第三方 ACP 代理时再引入 `acpx` 作为可选适配器。
+1. **Codex macOS `workspace-write` 双沙箱边界**：
+   - `.git/` 目录只读（`git add/commit` 建 `.git/index.lock` 会被拒绝）；
+   - 禁止绑定本地回环端口（`127.0.0.1:0` HTTP 集成测试会报 `Operation not permitted`）。
+   - **处理方式**：提示词明确告知在沙箱内跑通 compile/check + 本模块非网络单测，保留干净改动由主宿主验收提交；确需由 Codex 自提交时再显式加 `--sandbox danger-full-access`。
+2. **原生 Session 恢复与已删 Worktree 查看**：
+   - Codex 原生 TUI 按 CWD 过滤：Worktree 仍在时用 `cd "<wt>" && codex resume <sid>`；Worktree 已删时用 `codex resume --all -C "<main_repo>" <sid>` 或 `loopctl.py view --codex-id <sid>`。
+   - Claude Code：可用 `claude logs <bg_id>` / `claude attach <bg_id>` / `cd "<wt>" && claude --resume <sid>`，或跨目录无视 worktree 删存直接用 `loopctl.py view --claude-id <id>`。
+   - Antigravity Desktop 与 CLI 会话分库（`~/.gemini/antigravity/brain/` vs `antigravity-cli/brain/`），`agy --conversation <id>` 仅认 CLI 库；统一终端只读查看用 `loopctl.py view --agy-id <id>`。
+3. **不重复造轮子**：
+   - Codex 多文件内部并行流水线直接复用 `codex-workflows`；Claude Code 复杂多步任务用首行关键字 `ultracode`；
+   - Tmux 架构借鉴 `ccmux`、`dmux`、`workmux` 与 `claude --worktree --tmux`，保持纯 Python 标准库 + 原生 `tmux`，未来扩新 Harness 只需在 `loopctl.py` 注册对应 CLI 与日志解析器。

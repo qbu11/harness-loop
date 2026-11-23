@@ -189,6 +189,7 @@ class CliWorkflowAndSnippetTests(unittest.TestCase):
             doc = json.loads(res.stdout)
             self.assertTrue(doc["ok"])
             self.assertIn("binaries", doc)
+            self.assertIn("tmux", doc["binaries"])
             self.assertIn("skill_mounts", doc)
             self.assertIn("agy_brain_roots", doc)
             self.assertIn("harness-loop", doc["skill_mounts"]["canonical"]["path"])
@@ -297,6 +298,388 @@ class WatchAndAuditTests(unittest.TestCase):
             data = json.loads(report.stdout)
             self.assertTrue(data["ok"], data)
             self.assertEqual(data["failed"], 0, data)
+
+    def test_audit_commits_multimilestone_cui_stage_and_m2_order(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "good-ms"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            def _commit(msg: str, offset_sec: int) -> str:
+                env = dict(os.environ, GIT_AUTHOR_DATE=f"{1700000000 + offset_sec} +0000", GIT_COMMITTER_DATE=f"{1700000000 + offset_sec} +0000")
+                subprocess.run(["git", "add", "."], cwd=repo, check=True)
+                subprocess.run(["git", "commit", "-q", "-m", msg], cwd=repo, env=env, check=True)
+                return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            base_sha = _commit("chore: base", 0)
+
+            (repo / "backend").mkdir()
+            (repo / "backend" / "a.rs").write_text("// m1 backend\n", encoding="utf-8")
+            _commit("feat: M1-P0 backend api", 100)
+
+            (repo / "e2e" / "reports").mkdir(parents=True)
+            (repo / "e2e" / "reports" / "cli-acceptance.json").write_text(json.dumps({"passed": 10, "failed": 0}), encoding="utf-8")
+            _commit("test: M1 cli report", 120)
+
+            (repo / "frontend" / "src").mkdir(parents=True)
+            (repo / "frontend" / "src" / "App.tsx").write_text("export {};\n", encoding="utf-8")
+            _commit("feat: M1-GUI app shell", 200)
+
+            (repo / "e2e" / "reports" / "visual-acceptance.json").write_text(json.dumps({"passed": 20, "failed": 0}), encoding="utf-8")
+            _commit("test: M1 visual report", 220)
+
+            (repo / "backend" / "b.rs").write_text("// m2 backend\n", encoding="utf-8")
+            _commit("feat: M2-P0 triage engine", 300)
+
+            (repo / "e2e" / "reports" / "v2-m2-cli.json").write_text(json.dumps({"passed": 15, "failed": 0}), encoding="utf-8")
+            _commit("test: M2 cli acceptance", 320)
+
+            cui_rep = subprocess.run(
+                [sys.executable, "-B", str(SCRIPTS_DIR / "audit_commits.py"), "--repo", str(repo), "--base", base_sha, "--stage", "cui", "--json"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(cui_rep.returncode, 0, cui_rep.stdout)
+            cui_data = json.loads(cui_rep.stdout)
+            self.assertTrue(cui_data["ok"], cui_data)
+            self.assertEqual(cui_data["checks"][3]["milestone_orders"], {"M1": "ok", "M2": "ok"})
+
+            full_rep = subprocess.run(
+                [sys.executable, "-B", str(SCRIPTS_DIR / "audit_commits.py"), "--repo", str(repo), "--base", base_sha, "--stage", "full", "--json"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(full_rep.returncode, 1, full_rep.stdout)
+            full_data = json.loads(full_rep.stdout)
+            rep_chk = next(c for c in full_data["checks"] if c["name"] == "reports_zero_failed_and_fresh")
+            stale_names = [s["report"] for s in rep_chk.get("stale_reports") or []]
+            self.assertIn("e2e/reports/visual-acceptance.json", stale_names)
+
+            bad_repo = Path(td) / "bad-ms"
+            bad_repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main", "-q"], cwd=bad_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=bad_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=bad_repo, check=True)
+            (bad_repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=bad_repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "chore: base"], cwd=bad_repo, check=True)
+            bad_base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=bad_repo, text=True).strip()
+
+            (bad_repo / "backend").mkdir()
+            (bad_repo / "backend" / "m1.rs").write_text("// m1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=bad_repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "feat: M1-P0"], cwd=bad_repo, check=True)
+            (bad_repo / "frontend" / "src").mkdir(parents=True)
+            (bad_repo / "frontend" / "src" / "M1.tsx").write_text("export {};\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=bad_repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "feat: M1-GUI"], cwd=bad_repo, check=True)
+
+            (bad_repo / "frontend" / "src" / "M2.tsx").write_text("export {};\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=bad_repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "feat: M2-GUI jumped ahead"], cwd=bad_repo, check=True)
+            (bad_repo / "backend" / "m2.rs").write_text("// m2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=bad_repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "feat: M2-P0 late"], cwd=bad_repo, check=True)
+
+            bad_rep = subprocess.run(
+                [sys.executable, "-B", str(SCRIPTS_DIR / "audit_commits.py"), "--repo", str(bad_repo), "--base", bad_base, "--stage", "cui", "--json"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(bad_rep.returncode, 1)
+            bad_data = json.loads(bad_rep.stdout)
+            cui_chk = next(c for c in bad_data["checks"] if c["name"] == "cui_first_discipline")
+            self.assertFalse(cui_chk["passed"])
+            self.assertIn("[M2]", cui_chk["order_detail"])
+
+
+class V2WorktreeTmuxAndViewTests(unittest.TestCase):
+    def test_track_roster_and_model_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "home"
+            fake_home.mkdir()
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            env = dict(os.environ, HOME=str(fake_home))
+
+            init_out = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable, "-B", str(LOOPCTL_PATH), "init",
+                        "--repo", str(repo), "--slug", "track-demo",
+                        "--track", "backend_codex=codex:GPT-6.2-Sol",
+                        "--track", "frontend=claude",
+                        "--json",
+                    ],
+                    env=env, text=True,
+                )
+            )
+            tracks = init_out["manifest"]["roster"]["tracks"]
+            self.assertEqual(tracks["backend_codex"], {"harness": "codex", "model": "gpt-6.2-sol"})
+            self.assertEqual(tracks["frontend"], {"harness": "claude", "model": ""})
+
+            roster_out = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable, "-B", str(LOOPCTL_PATH), "set-roster",
+                        "--repo", str(repo), "--track", "reviewer=codex:Codex Auto Review", "--json",
+                    ],
+                    env=env, text=True,
+                )
+            )
+            self.assertEqual(roster_out["roster"]["tracks"]["reviewer"], {"harness": "codex", "model": "codex-auto-review"})
+
+            d_codex = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                        "--repo", str(repo), "--from", "agy", "--track", "backend_codex",
+                        "--prompt", "build backend", "--dry-run", "--json",
+                    ],
+                    env=env, text=True,
+                )
+            )
+            self.assertEqual(d_codex["to"], "codex")
+            self.assertEqual(d_codex["model"], "gpt-6.2-sol")
+
+            d_fe = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                        "--repo", str(repo), "--from", "agy", "--track", "frontend",
+                        "--prompt", "build ui", "--dry-run", "--json",
+                    ],
+                    env=env, text=True,
+                )
+            )
+            self.assertEqual(d_fe["to"], "claude")
+            self.assertEqual(d_fe["model"], "")
+
+    def test_worktree_scoped_write_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "main"
+            wt_other = Path(td) / "wt-other"
+            repo.mkdir()
+            wt_other.mkdir()
+            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+            try:
+                manifest = {
+                    "jobs": [
+                        {
+                            "job_id": "codex-main-1",
+                            "harness": "codex",
+                            "mode": "write",
+                            "workdir": str(repo),
+                            "pid": proc.pid,
+                            "status": "RUNNING",
+                        }
+                    ]
+                }
+                self.assertEqual(len(loopctl.find_active_write_conflicts(repo, manifest, target_workdir=repo)), 1)
+                self.assertEqual(loopctl.find_active_write_conflicts(repo, manifest, target_workdir=wt_other), [])
+            finally:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+    def test_tmux_session_run_job_dashboard_tail_and_wave_watch(self) -> None:
+        if not loopctl.tmux_bin():
+            self.skipTest("tmux not installed")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_home = root / "home"
+            fake_home.mkdir()
+            repo = root / "repo"
+            wt_a = root / "wt-a"
+            wt_b = root / "wt-b"
+            for d in (repo, wt_a, wt_b):
+                d.mkdir()
+                subprocess.run(["git", "init", "-b", "main", "-q"], cwd=d, check=True)
+                subprocess.run(["git", "config", "user.name", "Test"], cwd=d, check=True)
+                subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=d, check=True)
+                (d / "README.md").write_text("ok\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=d, check=True)
+                subprocess.run(["git", "commit", "-q", "-m", "chore: init"], cwd=d, check=True)
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            mock_codex = fake_bin / "codex"
+            mock_codex.write_text(
+                "\n".join([
+                    f"#!{sys.executable}",
+                    "import json, sys, time, pathlib",
+                    "out_file = ''",
+                    "args = sys.argv[1:]",
+                    "if '-o' in args:",
+                    "    out_file = args[args.index('-o') + 1]",
+                    "tid = f'01a2ffff-0000-0000-0000-{int(time.time() * 1000) % 10**12:012d}'",
+                    "print(json.dumps({'type': 'thread.started', 'thread_id': tid}), flush=True)",
+                    "time.sleep(0.5)",
+                    "cwd_name = pathlib.Path.cwd().name",
+                    "msg = f'Completed work in {cwd_name}'",
+                    "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': msg}}), flush=True)",
+                    "print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}}), flush=True)",
+                    "if out_file:",
+                    "    pathlib.Path(out_file).write_text(msg + '\\n', encoding='utf-8')",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            mock_codex.chmod(0o755)
+
+            sock = f"hl-test-{os.getpid()}-{int(time.time() * 1000) % 100000}"
+            env = dict(
+                os.environ,
+                HOME=str(fake_home),
+                PATH=f"{fake_bin}:{os.environ.get('PATH', '')}",
+                HARNESS_LOOP_TMUX_SOCKET=sock,
+            )
+            try:
+                subprocess.run(
+                    [sys.executable, "-B", str(LOOPCTL_PATH), "init", "--repo", str(repo), "--slug", "tmux-wave", "--json"],
+                    env=env, check=True, stdout=subprocess.DEVNULL,
+                )
+                d1 = json.loads(
+                    subprocess.check_output(
+                        [
+                            sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                            "--repo", str(repo), "--workdir", str(wt_a), "--wave", "w1",
+                            "--label", "worker-a", "--from", "agy", "--to", "codex",
+                            "--prompt", "task a", "--json",
+                        ],
+                        env=env, text=True,
+                    )
+                )
+                d2 = json.loads(
+                    subprocess.check_output(
+                        [
+                            sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                            "--repo", str(repo), "--workdir", str(wt_b), "--wave", "w1",
+                            "--label", "worker-b", "--from", "agy", "--to", "codex",
+                            "--prompt", "task b", "--json",
+                        ],
+                        env=env, text=True,
+                    )
+                )
+                self.assertTrue(d1["tmux_session"])
+                self.assertEqual(d1["tmux_session"], d2["tmux_session"])
+
+                st = json.loads(
+                    subprocess.check_output(
+                        [sys.executable, "-B", str(LOOPCTL_PATH), "tmux", "status", "--repo", str(repo), "--json"],
+                        env=env, text=True,
+                    )
+                )
+                self.assertTrue(st["tmux_session_alive"])
+                self.assertGreaterEqual(len(st["windows"]), 3)
+                self.assertEqual(len(st["jobs"]), 2)
+
+                tail_out = subprocess.check_output(
+                    [sys.executable, "-B", str(LOOPCTL_PATH), "tmux", "tail", "--repo", str(repo), "--job-id", d1["job_id"], "--lines", "30"],
+                    env=env, text=True,
+                )
+                self.assertIn("[harness-loop] Job:", tail_out)
+
+                w_res = subprocess.run(
+                    [
+                        sys.executable, "-B", str(LOOPCTL_PATH), "watch",
+                        "--repo", str(repo), "--wave", "w1",
+                        "--interval", "0.2", "--settle-seconds", "0.1", "--stall-timeout", "10", "--timeout", "20", "--json",
+                    ],
+                    env=env, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(w_res.returncode, 0, w_res.stdout + w_res.stderr)
+                w_data = json.loads(w_res.stdout)
+                self.assertTrue(w_data["ok"])
+                self.assertEqual(w_data["reason"], "WAVE_COMPLETED")
+                self.assertEqual(w_data["completed_count"], 2)
+
+                latest_txt = (repo / ".agent-loop" / "LATEST.md").read_text(encoding="utf-8")
+                self.assertIn("Completed work in wt-a", latest_txt)
+                self.assertIn("Completed work in wt-b", latest_txt)
+                self.assertIn("tmux -L", latest_txt)
+            finally:
+                subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True, check=False)
+
+    def test_universal_view_claude_codex_job_and_deleted_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_home = root / "home"
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+            cc_sid = "aaaa1111-2222-3333-4444-555566667777"
+            cc_dir = fake_home / ".claude" / "projects" / "-tmp-deleted-wt-alpha"
+            cc_dir.mkdir(parents=True)
+            cc_jsonl = cc_dir / f"{cc_sid}.jsonl"
+            cc_jsonl.write_text(
+                "\n".join([
+                    json.dumps({
+                        "type": "user",
+                        "timestamp": "2026-11-24T01:00:00Z",
+                        "sessionId": cc_sid,
+                        "cwd": "/tmp/nonexistent-deleted-wt-alpha",
+                        "gitBranch": "feat/demo",
+                        "message": {"role": "user", "content": "check module A"},
+                    }),
+                    json.dumps({
+                        "type": "assistant",
+                        "timestamp": "2026-11-24T01:00:05Z",
+                        "sessionId": cc_sid,
+                        "cwd": "/tmp/nonexistent-deleted-wt-alpha",
+                        "gitBranch": "feat/demo",
+                        "message": {
+                            "role": "assistant",
+                            "stop_reason": "end_turn",
+                            "content": [
+                                {"type": "tool_use", "name": "Read"},
+                                {"type": "text", "text": "Module A verified CLEAN."},
+                            ],
+                        },
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            codex_sid = "99990000-1111-2222-3333-444455556666"
+            codex_dir = fake_home / ".codex" / "sessions" / "2026" / "11" / "24"
+            codex_dir.mkdir(parents=True)
+            codex_rollout = codex_dir / f"rollout-2026-11-24T01-00-00-{codex_sid}.jsonl"
+            codex_rollout.write_text(
+                "\n".join([
+                    json.dumps({
+                        "timestamp": "2026-11-24T01:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": codex_sid, "cwd": "/tmp/nonexistent-deleted-wt-beta"},
+                    }),
+                    json.dumps({
+                        "timestamp": "2026-11-24T01:00:08Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Codex batch verified cleanly."}],
+                        },
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            env = dict(os.environ, HOME=str(fake_home))
+            cc_prefix_view = subprocess.check_output(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "view", "--claude-id", "aaaa1111", "--last", "5", "--full"],
+                env=env, text=True,
+            )
+            self.assertIn(cc_sid, cc_prefix_view)
+            self.assertIn("Module A verified CLEAN.", cc_prefix_view)
+            self.assertIn("Read", cc_prefix_view)
+
+            codex_view = subprocess.check_output(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "view", "--codex-id", codex_sid, "--last", "5"],
+                env=env, text=True,
+            )
+            self.assertIn("codex resume --all", codex_view)
+            self.assertIn("Codex batch verified cleanly.", codex_view)
 
 
 if __name__ == "__main__":

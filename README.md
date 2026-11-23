@@ -1,7 +1,7 @@
 # harness-loop
 
-> 多 Harness 动态闭环协作与可追溯编排 Skill — 当前内置 **Antigravity (`agy`) ↔ Claude Code (`claude`) ↔ Codex (`codex`, 含 `GPT-6.2-Sol`)** 适配器，并面向未来任意新 CLI / ACP Harness 扩展。  
-> 零外部依赖（纯 Python 3 标准库）、零等待 Token 消耗、零全局 Hook 侵入——新电脑一行命令装完即可直接调用。
+> 多 Harness 动态闭环协作与 `tmux` 并行编排 Skill —— 内置 **Antigravity (`agy`) ↔ Claude Code (`claude`) ↔ Codex (`codex`, 含 `GPT-6.2-Sol`)**，并可平顺扩展更多 CLI/ACP Harness。  
+> 纯 Python 3 标准库实现（零外部依赖）、全会话 `tmux` 实时可视化、零等待 Token 消耗。
 
 ---
 
@@ -11,62 +11,57 @@
 curl -fsSL https://raw.githubusercontent.com/qbu11/harness-loop/main/install.sh | bash
 ```
 
-安装脚本会自动完成：
-1. 将仓库拉取到规范目录 `~/.agents/skills/harness-loop`；
-2. 自动建立 **Claude Code**（`~/.claude/skills/`）、**Codex**（`~/.codex/skills/`）与 **Antigravity**（`~/.gemini/config/skills/`）软链接（若 `~/.gemini/config/skills` 本身已软链到 `~/.agents/skills`，会自动识别并跳过，不产生嵌套自链）；
-3. 运行 `loopctl.py doctor` 输出各端 CLI 与挂载自检报告。
+安装脚本自动完成：
+1. 克隆到规范目录 `~/.agents/skills/harness-loop`；
+2. 挂载 **Claude Code**（`~/.claude/skills/`）、**Codex**（`~/.codex/skills/`）与 **Antigravity**（`~/.gemini/config/skills/`）软链；
+3. 运行 `loopctl.py doctor` 输出各端 CLI、`tmux` 与软链状态。
 
-如果希望安装时顺便把协作角色约定写入某个项目仓库的 `AGENTS.md`：
+安装同时为项目写入协作约定：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/qbu11/harness-loop/main/install.sh | bash -s -- --init-agents /path/to/your-repo
 ```
 
-也可以手动克隆安装（或用 `npx skills`）：
+---
 
-```bash
-git clone https://github.com/qbu11/harness-loop.git ~/.agents/skills/harness-loop
-bash ~/.agents/skills/harness-loop/install.sh
-```
+## 核心能力
+
+1. **全会话默认跑在 `tmux`（Window 0 总览看板 + 独立命名窗）**
+   - `delegate` 与 `consult` 默认在 `hl-<slug>` 会话中开启独立窗口执行（Codex/AGY 实时解码流式进度，Claude Code `--bg` 自动 `attach` 进窗），局部开启 `mouse on` 与 `remain-on-exit on`，不改全局 `~/.tmux.conf`。
+   - 随时 `loopctl.py tmux attach --repo <repo>` 进场鼠标切窗或 `Ctrl-b d` 脱离，也可不进 TUI 直接 `loopctl.py tmux status` / `tmux tail --job-id <id>` 抓屏。
+2. **多 Git Worktree 并行波次 & 按赛道花名册（`--track`）**
+   - `delegate --workdir <wt> --wave <w> --track <name>` 支持多路隔离并行，写冲突检查精确限定到目标 `workdir`，`fcntl` 可重入文件锁 + 原子写保护 `manifest.json` 并发更新。
+3. **跨端只读咨询 & 零 Token 整波守候**
+   - `consult`（强制各端只读模式）负责跨端评审；`watch --wave <w>` 综合终态事件、原子退出码、PID/僵尸进程、工作区活跃度与静默卡死阈值，全波完工自动汇总入账。
+4. **全端统一可读回放（无视 Worktree 删存）**
+   - `loopctl.py view --repo <repo>` 一行汇总台账与各端记录；
+   - 支持 `--claude-id <uuid或8位bg_id>`、`--codex-id <uuid>`、`--agy-id <uuid>`、`--job-id <id>`、`--full`，即使原 Worktree 已删除仍可秒级回放对话。
+5. **多里程碑提交审计（`audit_commits.py --stage cui|full`）**
+   - 独立检查每里程碑（`M1`, `M2`...）后端先于前端纪律、工作区洁净、无 AI 署名、无残留失败截图与测试报告新鲜度。
 
 ---
 
-## 核心特性
-
-1. **动态多端角色花名册（Architect / Executor / Verifier / Advisor）**
-   - 默认由 **Antigravity (`agy`)** 任 Architect + Post-Verifier + 体验官，**Claude Code (`claude`)**（复杂需求自动首行加 `ultracode`）或 **Codex (`gpt-6.2-sol`)** 任 Executor，任意回合可用 `loopctl.py set-roster` 动态换将或指定具体模型。
-   - **默认不覆盖目标 Harness 全局配置**：未显式传入 `--model` 时不传 `-m`/`--model`，且绝不跨端传递认证或 Provider 环境变量；扩展新 Harness 只需在 `loopctl.py` 适配对应 CLI 参数与日志解析，角色编排与 `.agent-loop/` 台账无需改动。
-2. **多端跨端互调网（`consult` / `delegate` / `inspect`）**
-   - `consult`：**只读取经与对抗审校**（强制 AGY `--mode plan`、Claude `--permission-mode plan`、Codex `-s read-only`），不修改业务文件；
-   - `delegate`：**跨端派活改码**（同仓库单写者冲突保护 + `HARNESS_LOOP_DEPTH < 2` 防递归护栏）；
-   - `inspect`：**纯只读实时切片检查**，可带 `--sync-ledger` 同步完整交卷正文。
-3. **零 Token 四合一本地监测（`loopctl.py watch`）**
-   - 不改各端全局 Hook 配置（避开 Codex `hooks.json` 交互式信任门禁与崩溃漏触发问题），也不靠 LLM `schedule` 空烧轮询 Token；
-   - 通过 **终态事件（`task_complete` / `end_turn` / `StopFailure` / `turn_aborted`）+ PID 存活（含 `ps -o stat=` 识别 UNIX `Z` 僵尸态）+ 日志/Git/子进程活跃度 + 卡死阈值（`--stall-timeout`）** 实时监测，完工瞬间退出并借 AGY 原生后台任务回调精准唤醒当前对话。
-4. **全链路透明台账与终端一行回看（`loopctl.py view`）**
-   - 在目标仓库自动生成 git-ignored `<repo>/.agent-loop/LATEST.md`（实际存放在 `<repo>/.agent-loop/<run-id>/DIALOGUE.md`），带结构化事件、SHA-256 哈希与原生恢复命令；
-   - 终端一行命令 `python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py view --repo <repo>` 同时回看 Codex + AGY 双端对话，并直接给出 `cd "<repo>" && codex resume <sid>`。
-5. **Post-Verifier 确定性提交审计（`audit_commits.py`）**
-   - 自动核查工作区洁净度、CUI-First 提交顺序、无 AI 署名、保护目录未触碰、零残留失败截图与验证报告新鲜度。
-
----
-
-## 新项目接入模板（`AGENTS.md`）
-
-运行以下命令即可给当前项目写入（或打印）各 Harness 的默认角色口径：
+## 常用命令速查
 
 ```bash
-python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py snippet --append /path/to/repo
-```
+# 1. 初始化并绑定赛道模型（未显式指定则继承目标 CLI 全局默认）
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py init \
+  --repo . --slug my-feature --track backend_codex=codex:GPT-6.2-Sol --track frontend=claude --json
 
-写入内容如下（每个 Harness 仅 1 行，打开仓库即读懂分工）：
+# 2. 在隔离 worktree 派发并行任务（自动进 tmux + 看板）
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py delegate \
+  --repo . --workdir ../wt-backend --wave wave1 --track backend_codex --label backend --from agy --prompt-file task.md --json
 
-```markdown
-## 多 Harness 协作角色（默认口径，均调用 `harness-loop`）
+# 3. 查看全波实时进度或进入 tmux
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py tmux status --repo .
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py tmux attach --repo .
 
-- **Antigravity（`agy`）**：默认任 **Architect + Post-Verifier + 体验官**——负责项目审查、撰写 PRD/Tech-Spec/Test-Plan/Handoff 规格包，用 `loopctl.py delegate` 派活并挂 `loopctl.py watch` 零 Token 守候，完工后独立四维终审、实机体验并向用户结项。
-- **Claude Code（`claude`）**：默认任 **Executor**（复杂需求默认首行 `ultracode`）——严格按规格包 CUI-First 分阶段施工与提交，遇口径疑问可 `loopctl.py consult` 取经，收口前自跑 `audit_commits.py` 并回写 `.agent-loop/LATEST.md`。
-- **Codex（`codex`，如 `GPT-6.2-Sol`）**：按用户指定任 **Executor / 审校顾问**——承担开发实现或对抗性代码审校，保持原生会话可追溯（`codex resume`），进度与交付同步至 `.agent-loop/LATEST.md`。
+# 4. 零 Token 等待整波完成
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py watch --repo . --wave wave1 --json
+
+# 5. 回看任意 Claude / Codex / AGY 会话内容
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py view --claude-id <id>
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py view --codex-id <id>
 ```
 
 ---
@@ -75,20 +70,20 @@ python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py snippet --append /pa
 
 ```text
 harness-loop/
-├── SKILL.md                             # 多 Harness 共用的主规范入口
-├── agents/openai.yaml                   # Codex / Agents UI 元数据
+├── SKILL.md                             # 主规范入口
+├── agents/openai.yaml                   # Agents UI 元数据
 ├── install.sh                           # 跨平台一键安装与软链脚本
 ├── references/
-│   ├── cross-harness-mesh.md            # 跨端互调矩阵、模型别名与实测注意项
-│   ├── doc-pack-templates.md            # PRD / Tech-Spec / Test-Plan / Handoff 骨架
-│   └── verifier-and-ux-playbook.md      # 零 Token watch 监测 + 四维终审 + 真实用户体验手册
+│   ├── cross-harness-mesh.md            # 跨端互调、tmux 编排、赛道模型与沙箱边界
+│   ├── doc-pack-templates.md            # 六件套文档骨架 + 3 套执行提示词 + 返工模板
+│   └── verifier-and-ux-playbook.md      # tmux/watch 守候 + 四维终审 + 实机用户体验
 └── scripts/
-    ├── loopctl.py                       # 核心编排、consult/delegate/inspect/watch/view/doctor/snippet
-    ├── audit_commits.py                 # Post-Verifier 7 项确定性工程审计
-    └── test_loopctl.py                  # 零外部依赖隔离单元测试集
+    ├── loopctl.py                       # 核心引擎（init/delegate/consult/tmux/watch/view/doctor）
+    ├── audit_commits.py                 # 多里程碑 CUI-First 与门禁审计
+    └── test_loopctl.py                  # 隔离单元测试集（含真实独立 tmux 测试）
 ```
 
-运行自带测试与环境诊断：
+运行测试与环境自检：
 
 ```bash
 python3 -B -m unittest discover -s ~/.agents/skills/harness-loop/scripts -v

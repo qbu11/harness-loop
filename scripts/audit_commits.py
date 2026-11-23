@@ -20,6 +20,7 @@ from typing import Any
 DEFAULT_FRONTEND_PREFIXES = ("frontend/src/", "src/components/", "src/pages/")
 DEFAULT_FORBIDDEN_PREFIXES = ("backend/data/", "docs/design-refs/")
 DEFAULT_CUI_REGEX = r"(?i)(p0|cui|cli先行|后端|backend\b)"
+DEFAULT_MILESTONE_REGEX = r"(?i)(?:^|[^A-Za-z0-9])(M\d+)(?=$|[^A-Za-z0-9])"
 AI_ATTRIBUTION_RE = re.compile(
     r"(?i)(co-authored-by:\s*[^\n]*(claude|anthropic|openai|codex|gemini|copilot)|generated with \[?claude|noreply@anthropic\.com|🤖\s*generated)"
 )
@@ -131,16 +132,26 @@ def load_commit_records(
     return commits
 
 
+def _extract_milestone(subject: str, milestone_re: re.Pattern[str] | None) -> str:
+    """Extract normalized milestone token (e.g. 'M1', 'M2') from commit subject."""
+    if not milestone_re:
+        return ""
+    m = milestone_re.search(subject)
+    return m.group(1).upper() if m else ""
+
+
 def check_cui_first(
     commits: list[dict[str, Any]],
     cui_regex: re.Pattern[str],
     frontend_prefixes: tuple[str, ...],
+    milestone_regex: re.Pattern[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Verify CUI-First commit boundary and ordering rules."""
+    """Verify CUI-First commit boundary and per-milestone backend-before-frontend ordering."""
     cui_violations: list[dict[str, Any]] = []
     feat_backend_indices: list[int] = []
     feat_frontend_indices: list[int] = []
     mixed_feat_commits: list[str] = []
+    milestone_buckets: dict[str, dict[str, list[int]]] = {}
 
     for idx, c in enumerate(commits):
         frontend_files = [f for f in c["files"] if any(f.startswith(p) for p in frontend_prefixes)]
@@ -157,10 +168,35 @@ def check_cui_first(
                 feat_backend_indices.append(idx)
             if has_frontend:
                 feat_frontend_indices.append(idx)
+            ms = _extract_milestone(c["subject"], milestone_regex)
+            if ms:
+                bucket = milestone_buckets.setdefault(ms, {"backend": [], "frontend": []})
+                if has_backend:
+                    bucket["backend"].append(idx)
+                if has_frontend:
+                    bucket["frontend"].append(idx)
 
     order_ok = True
     order_detail = "ok"
-    if feat_backend_indices and feat_frontend_indices:
+    milestone_orders: dict[str, str] = {}
+    if milestone_buckets:
+        bad_details: list[str] = []
+        for ms in sorted(milestone_buckets):
+            b_idxs = milestone_buckets[ms]["backend"]
+            f_idxs = milestone_buckets[ms]["frontend"]
+            if b_idxs and f_idxs and min(f_idxs) < min(b_idxs):
+                msg = (
+                    f"[{ms}] frontend feat commit (idx {min(f_idxs)}) precedes "
+                    f"backend feat commit (idx {min(b_idxs)})"
+                )
+                milestone_orders[ms] = msg
+                bad_details.append(msg)
+            else:
+                milestone_orders[ms] = "ok"
+        if bad_details:
+            order_ok = False
+            order_detail = "; ".join(bad_details)
+    elif feat_backend_indices and feat_frontend_indices:
         if min(feat_frontend_indices) < min(feat_backend_indices):
             order_ok = False
             order_detail = (
@@ -183,6 +219,7 @@ def check_cui_first(
         "mixed_feat_commits": mixed_feat_commits,
         "order_ok": order_ok,
         "order_detail": order_detail,
+        "milestone_orders": milestone_orders,
     }
 
 
@@ -254,8 +291,10 @@ def inspect_reports(
     reports_dir: str,
     allow_known: set[str],
     prefer_git: bool,
+    *,
+    stage: str = "full",
 ) -> tuple[bool, dict[str, Any]]:
-    """Check report zero-failure invariant and freshness relative to last code commit."""
+    """Check report zero-failure invariant and stage-appropriate freshness relative to code commits."""
     prefix = reports_dir.rstrip("/") + "/"
     touched_reports: dict[str, int] = {}
     for c in commits:
@@ -274,7 +313,7 @@ def inspect_reports(
     last_code_ts = max(last_backend_ts, last_frontend_ts)
 
     gui_report_re = re.compile(
-        r"(smoke|visual|ui|acceptance-report|research-acceptance|frontend-.*-acceptance|v[6-9].*-acceptance)"
+        r"(smoke|visual|ui|acceptance-report|research-acceptance|frontend-.*-acceptance|v(?:[6-9]|\d{2,}).*-acceptance)"
     )
 
     candidate_paths: list[str] = sorted(touched_reports.keys())
@@ -288,13 +327,19 @@ def inspect_reports(
             ]
 
     failed_reports: list[dict[str, Any]] = []
-    stale_reports: list[dict[str, Any]] = []
+    stale_candidates: list[dict[str, Any]] = []
     checked: list[dict[str, Any]] = []
+    skipped_gui_reports: list[str] = []
     max_report_ts = 0
+    has_fresh_cli_report = False
 
     for rel in candidate_paths:
         name = Path(rel).name
         if name in allow_known:
+            continue
+        is_gui_report = bool(gui_report_re.search(name))
+        if stage == "cui" and is_gui_report:
+            skipped_gui_reports.append(rel)
             continue
         data = read_json_at_ref_or_disk(repo, head, rel, prefer_git=prefer_git)
         if not data:
@@ -305,31 +350,51 @@ def inspect_reports(
             continue
 
         report_ts = touched_reports.get(rel, 0)
-        if not prefer_git and (repo / rel).exists():
-            report_ts = max(report_ts, int((repo / rel).stat().st_mtime))
+        disk_report = repo / rel
+        if not prefer_git and disk_report.exists():
+            is_dirty_or_untracked = rel not in touched_reports
+            if not is_dirty_or_untracked:
+                rc_st, st_out, _ = run_git(repo, ["status", "--porcelain", "--", rel])
+                is_dirty_or_untracked = rc_st == 0 and bool(st_out.strip())
+            if is_dirty_or_untracked:
+                report_ts = max(report_ts, int(disk_report.stat().st_mtime))
         max_report_ts = max(max_report_ts, report_ts)
 
-        is_gui_report = bool(gui_report_re.search(name))
-        required_ts = last_code_ts if is_gui_report else last_backend_ts
+        required_ts = last_backend_ts if stage == "cui" else (last_code_ts if is_gui_report else last_backend_ts)
         is_fresh = True
         if required_ts and report_ts and report_ts + 5 < required_ts:
             is_fresh = False
-            stale_reports.append({"report": rel, "report_ts": report_ts, "required_ts": required_ts})
+            stale_candidates.append({"report": rel, "report_ts": report_ts, "required_ts": required_ts})
+        elif required_ts and report_ts and not is_gui_report:
+            has_fresh_cli_report = True
 
         item = {"report": rel, "passed": passed_val, "failed": failed_val, "fresh": is_fresh}
         checked.append(item)
         if isinstance(failed_val, (int, float)) and failed_val > 0:
             failed_reports.append(item)
 
+    older_milestone_reports: list[dict[str, Any]] = []
+    if stage == "cui" and has_fresh_cli_report:
+        older_milestone_reports = stale_candidates
+        stale_reports: list[dict[str, Any]] = []
+        for item in checked:
+            if not item["fresh"]:
+                item["older_milestone"] = True
+    else:
+        stale_reports = stale_candidates
+
     missing_frontend_report = bool(
-        last_frontend_ts and checked and max_report_ts and max_report_ts + 5 < last_frontend_ts
+        stage != "cui" and last_frontend_ts and checked and max_report_ts and max_report_ts + 5 < last_frontend_ts
     )
     passed = not failed_reports and not stale_reports and not missing_frontend_report
     return passed, {
+        "stage": stage,
         "checked_count": len(checked),
         "checked": checked,
+        "skipped_gui_reports": skipped_gui_reports,
         "failed_reports": failed_reports,
         "stale_reports": stale_reports,
+        "older_milestone_reports": older_milestone_reports,
         "missing_frontend_report": missing_frontend_report,
         "last_backend_commit_ts": last_backend_ts,
         "last_frontend_commit_ts": last_frontend_ts,
@@ -343,6 +408,9 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     frontend_prefixes = tuple(args.frontend_prefix) if args.frontend_prefix else DEFAULT_FRONTEND_PREFIXES
     forbidden_prefixes = tuple(args.forbid_path) if args.forbid_path else DEFAULT_FORBIDDEN_PREFIXES
     cui_regex = re.compile(args.cui_stage_regex)
+    milestone_raw = getattr(args, "milestone_regex", DEFAULT_MILESTONE_REGEX)
+    milestone_regex = re.compile(milestone_raw) if milestone_raw else None
+    stage = getattr(args, "stage", "full")
     allow_known = set(args.allow_known_report or [])
 
     rc_head, head_sha, _ = run_git(repo, ["rev-parse", args.head])
@@ -380,7 +448,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     ]
     checks.append({"name": "no_ai_attribution", "passed": len(ai_hits) == 0, "hits": ai_hits})
 
-    cui_ok, cui_detail = check_cui_first(commits, cui_regex, frontend_prefixes)
+    cui_ok, cui_detail = check_cui_first(commits, cui_regex, frontend_prefixes, milestone_regex=milestone_regex)
     checks.append({"name": "cui_first_discipline", "passed": cui_ok, **cui_detail})
 
     rc_diff, diff_out, _ = run_git(repo, ["diff", "--name-only", f"{args.base}..{args.head}"])
@@ -401,7 +469,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     reports_ok, reports_detail = inspect_reports(
-        repo, args.base, args.head, commits, args.reports_dir, allow_known, prefer_git=prefer_git
+        repo, args.base, args.head, commits, args.reports_dir, allow_known, prefer_git=prefer_git, stage=stage
     )
     checks.append({"name": "reports_zero_failed_and_fresh", "passed": reports_ok, **reports_detail})
 
@@ -410,6 +478,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "repo": str(repo),
         "range": f"{args.base}..{args.head}",
+        "stage": stage,
         "passed": passed_count,
         "failed": failed_count,
         "ok": failed_count == 0,
@@ -422,6 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", default=".")
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", default="HEAD")
+    parser.add_argument("--stage", choices=("full", "cui"), default="full")
+    parser.add_argument("--milestone-regex", default=DEFAULT_MILESTONE_REGEX)
     parser.add_argument("--frontend-prefix", action="append", default=None)
     parser.add_argument("--cui-stage-regex", default=DEFAULT_CUI_REGEX)
     parser.add_argument("--forbid-path", action="append", default=None)
