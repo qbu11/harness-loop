@@ -82,7 +82,8 @@ python3 -B ~/.agents/skills/harness-loop/scripts/audit_commits.py \
 - 不同视口下宽屏分栏与窄屏降级是否无横向溢出、破图或乱码。
 
 ### 裁决与返工
-- 存在任何阻断或中高风险隐患 → 记录 `record --event verifier_audit --verdict NEEDS_FIX`，按 `doc-pack-templates.md §4` 生成精确 `文件:行号` 返工单并调 `loopctl.py delegate` 打回修复（自动返工上限 2 轮，满 2 轮升级用户决定）。
+- 存在任何阻断或中高风险隐患 → 记录 `record --event verifier_audit --verdict NEEDS_FIX`，按 `doc-pack-templates.md §4` 生成精确 `文件:行号` 返工单并调 `loopctl.py delegate --rework` 打回修复。
+- **自动返工硬上限**：`max_rounds` 默认 `2`；达到上限或同一错误跨轮复现时，继续 `delegate --rework` 会被强制拦截并置为 `ESCALATED`，此时改用 `loopctl.py record --event escalate --summary "<阻塞原因与备选方案>"` 升级用户决定（用户确认后可加 `--force` 放行）。
 - 全部通过 → 记录 `record --event verifier_audit --verdict PASS`，进入 Stage 5。
 
 ---
@@ -95,7 +96,8 @@ python3 -B ~/.agents/skills/harness-loop/scripts/audit_commits.py \
    - 切换目标用户视角（而非测试工程师视角），完整走通核心漏斗或端到端工作流。
 3. **执行体验并读图核对**：
    - Web 项目：委派 `browser` 子代理（默认 `Model="flash"`）真实操作并截图，主代理按 `BROWSER_HOST_FACTS` 用 `read_file` 复核截图；
-   - 纯 CLI 项目：以真实用户样本完整跑通核心命令行流程并记录响应速度与报错可读性。
-4. **沉淀结论并结项询问（Stage 6）**：
-   - 运行 `loopctl.py record --event ux_walkthrough` 与 `--event signoff`；
-   - 向用户输出：① 门禁实测表；② 真实用户视角体验报告（爽点、轻微卡点与 1–3 条高价值下一步建议）；③ `tmux` / `view` / 各端恢复指令清单；④ 询问是否授权 `git push` 或下一步方向。
+   - 纯 CLI 项目：以真实用户样本完整跑通核心命令行流程并记录响应速度与报错可读性（无前端可交互界面时，若跳过 `ux_walkthrough` 须在 `signoff` 显式传 `--skip-ux`）。
+4. **严格结项门禁（`signoff` → `DONE`）与收尾**：
+   - 运行 `loopctl.py record --event ux_walkthrough` 与 `loopctl.py record --event signoff`；
+   - **`signoff` 自动校验三项前置条件**（缺一则拒绝并报错）：① `verdict == PASS`；② 所有 `jobs` 无活跃或未闭环失败项；③ 本轮已记录 `ux_walkthrough`（或显式 `--skip-ux`）。全部通过后自动落为终态 `DONE`；
+   - 向用户输出：① 门禁实测表；② 真实用户视角体验报告（爽点、轻微卡点与 1–3 条高价值下一步建议）；③ `tmux` / `view` / 各端恢复指令清单；④ 询问是否授权 `git push` 或运行 `loopctl.py tmux stop --all` 清理窗口。

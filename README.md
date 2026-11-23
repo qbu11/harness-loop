@@ -38,6 +38,8 @@ curl -fsSL https://raw.githubusercontent.com/qbu11/harness-loop/main/install.sh 
    - 支持 `--claude-id <uuid或8位bg_id>`、`--codex-id <uuid>`、`--agy-id <uuid>`、`--job-id <id>`、`--full`，即使原 Worktree 已删除仍可秒级回放对话。
 5. **多里程碑提交审计（`audit_commits.py --stage cui|full`）**
    - 独立检查每里程碑（`M1`, `M2`...）后端先于前端纪律、工作区洁净、无 AI 署名、无残留失败截图与测试报告新鲜度。
+6. **清晰闭环终止与返工上限硬门禁（`DONE / ESCALATED / ABORTED`）**
+   - `delegate --rework` 默认上限 `2` 轮，超限自动拦截并置 `ESCALATED`；`record --event signoff` 硬校验 `PASS` + 无活跃/失败任务 + `ux_walkthrough` 后才落为 `DONE`，也支持 `escalate` / `abort` 显式停机。
 
 ---
 

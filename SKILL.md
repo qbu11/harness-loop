@@ -24,36 +24,48 @@ metadata:
 [Phase 3: 进度与零Token守候]──▶ tmux attach / tmux status / tmux tail 实时看；watch --wave 零 Token 守候
                             ──▶ 任意端中途疑问用 consult（只读）或 inspect/view 互通
 [Phase 4: Post-Verifier]    ──▶ audit_commits.py --stage <cui|full> + 读 Diff + 复跑快检 + 逐张读图
-                            ├─ NEEDS_FIX（<2 轮）▶ FILE:LINE 返工单 ▶ delegate 打回回 Phase 3
+                            ├─ NEEDS_FIX（round < max_rounds，默认 2）▶ delegate --rework 回 Phase 3
                             └─ PASS ──────────────▶ 进入 Phase 5
 [Phase 5: 交付实机体验]     ──▶ 跑活体健康检查（如 dev-status.sh）→ 扮演真实用户走通核心链路
-[Phase 6: 结项与追溯清单]   ──▶ signoff + 输出门禁实测表 + tmux/view/resume 直达命令 + 询问下一步
+[Phase 6: 结项或升级停机]   ──▶ signoff（DONE）| escalate（ESCALATED）| abort（ABORTED）
 ```
 
 ---
 
-## 2. `loopctl.py` 与 `audit_commits.py` 速查
+## 2. 闭环结束与升级停机条件（Exit Criteria）
+
+闭环只有 **3 种合法终态**；`loopctl.py` 用硬门禁拦住超轮次自动返工与未达标强行结项：
+
+| 终态 (`phase`) | 触发方式 | 必须同时满足的条件 | 后续动作 |
+|---|---|---|---|
+| **`DONE`**（正常完工） | `record --event signoff` | ① 全波 `jobs` 无活跃/未闭环失败项、worktree 已合并；② `audit_commits.py --stage full` 返回 `0 failed`；③ 已记录 `verifier_audit --verdict PASS`；④ 已记 `ux_walkthrough`（纯脚本/无界面任务显式传 `--skip-ux`） | 输出门禁实测表与恢复命令；默认保留本地提交（未授权不 `git push`）与 `tmux` 供回看，确认清理时跑 `tmux stop --all` |
+| **`ESCALATED`**（异常升级） | `record --event escalate` 或返工超限自动触发 | 命中任一停机红线：① `delegate --rework` / `send-cc` 达 `max_rounds`（默认 `2`）仍 `NEEDS_FIX`；② 同一错误跨轮复现；③ `watch` 报 `STALLED`（600s）或 `TIMEOUT`（7200s）；④ 缺凭据/沙箱/第三方硬阻塞；⑤ 需求冲突或修补须破契约 | 立即停止自动派活，列出阻塞证据与 2–3 个选项交用户拍板；用户确认后加 `--force` 放行 |
+| **`ABORTED`**（用户中止） | `record --event abort` | 用户明确取消本轮目标或要求止损 | 按需保留或归档 worktree，停掉相关窗口后收口 |
+
+---
+
+## 3. `loopctl.py` 与 `audit_commits.py` 速查
 
 脚本目录：`"$HOME/.agents/skills/harness-loop/scripts"`
 
 | 命令 | 用途 | 核心参数 |
 |---|---|---|
-| `loopctl.py init` | 初始化闭环、花名册与赛道 | `--repo <dir> --slug <slug> [--architect/--executor/--verifier] [--track k=h[:m]] [--tmux-session s] [--agy-id <uuid>] --json` |
+| `loopctl.py init` | 初始化闭环、花名册与赛道 | `--repo <dir> --slug <slug> [--architect/--executor/--verifier] [--track k=h[:m]] [--max-rounds 2] [--tmux-session s] --json` |
 | `loopctl.py set-roster` | 运行中动态改角色/赛道/模型 | `--repo <dir> [--executor ...] [--track k=h[:m]] --json` |
-| `loopctl.py delegate` | **派发写任务（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] [--wave w] [--track t] [--label lbl] [--to h] [--model m] [--ultracode\|--no-ultracode] [--tmux\|--no-tmux] [--prompt-file p] --json` |
+| `loopctl.py delegate` | **派发写任务（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] [--wave w] [--track t] [--label lbl] [--to h] [--model m] [--rework] [--force] [--tmux\|--no-tmux] --json` |
 | `loopctl.py consult` | **只读跨端评审（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] --from <h> --to <h> (--prompt\|--prompt-file) [--no-tmux] --json` |
 | `loopctl.py watch` | **零 Token 守候单任务/整波** | `--repo <dir> (--job-id id \| --wave w \| --jobs id1,id2 \| --all-active \| --harness h) [--stall-timeout 600] --json` |
 | `loopctl.py tmux` | 看板、接入、抓屏、停止 | `status \| dashboard \| attach [--job-id id] \| tail [--job-id id] [--lines 40] \| stop (--job-id id\|--all)` |
 | `loopctl.py view` | **纯只读回放任意端会话全文** | `[--repo dir] [--target all\|dialogue\|claude\|codex\|agy] [--claude-id id] [--codex-id id] [--agy-id id] [--job-id id] [--last 10] [--full]` |
 | `loopctl.py inspect` | 结构化只读切片 + 同步交卷 | `--harness <agy\|claude\|codex> --repo <dir> [--workdir <wt>] [--job-id id] [--sync-ledger] --json` |
-| `loopctl.py record` | 手工写入事件与裁决 | `--repo <dir> --role <r> --event <type> --summary <txt> [--body-file p] [--verdict PASS\|NEEDS_FIX] [--commits csv]` |
+| `loopctl.py record` | 写入事件、终审与停机终态 | `--repo <dir> --role <r> --event <type> --summary <txt> [--verdict PASS\|NEEDS_FIX] [--skip-ux] [--force] [--commits csv]` |
 | `loopctl.py snippet` | 追加项目 `AGENTS.md` 三行分工 | `[--append <repo>] [--json]` |
 | `loopctl.py doctor` | 自检各 CLI、`tmux` 与软链 | `[--json]` |
 | `audit_commits.py` | 7 项工程纪律与多里程碑审计 | `--repo <dir> --base <sha> [--stage full\|cui] [--skip-worktree-check] --json` |
 
 ---
 
-## 3. 通用纪律与防踩坑规则
+## 4. 通用纪律与防踩坑规则
 
 1. **只读咨询 vs 写入派发分离**：拿不准架构/接口时调用 `consult`（强制只读）；写代码用 `delegate`（带同 `workdir` 防双写锁 + `HARNESS_LOOP_DEPTH < 2` 防递归）。
 2. **默认继承目标 Harness 全局模型**：未显式指定模型时不传 `--model`/`-m`，且绝不跨端传递认证或 Provider 环境变量。详细模型别名与多赛道用法见 [references/cross-harness-mesh.md](references/cross-harness-mesh.md)。
@@ -65,7 +77,7 @@ metadata:
 
 ---
 
-## 4. 终端直达与追溯清单（回复末尾必附）
+## 5. 终端直达与追溯清单（回复末尾必附）
 
 - **Tmux 实时看板**：`tmux attach -t <tmux_session>`（或 `loopctl.py tmux attach --repo "<repo>"`）
 - **闭环总台账**：`[LATEST.md](file://<repo>/.agent-loop/LATEST.md)`
@@ -78,7 +90,7 @@ metadata:
 
 ---
 
-## 5. 新项目 `AGENTS.md` 三行接入模板
+## 6. 新项目 `AGENTS.md` 三行接入模板
 
 运行 `python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py snippet --append <repo>`：
 

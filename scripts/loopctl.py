@@ -50,6 +50,9 @@ AGY_CLI_BRAIN_ROOT = Path.home() / ".gemini" / "antigravity-cli" / "brain"
 CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 CODEX_INDEX_FILE = Path.home() / ".codex" / "session_index.jsonl"
 
+DEFAULT_MAX_ROUNDS = 2
+TERMINAL_PHASES = ("DONE", "ESCALATED", "ABORTED")
+
 VALID_EVENTS = (
     "audit_summary",
     "doc_pack_ready",
@@ -57,9 +60,12 @@ VALID_EVENTS = (
     "cc_progress",
     "cc_delivery",
     "verifier_audit",
+    "rework",
     "rework_to_cc",
     "ux_walkthrough",
     "signoff",
+    "escalate",
+    "abort",
     "roster_set",
     "cross_consult",
     "cross_feedback",
@@ -74,9 +80,12 @@ EVENT_LABELS = {
     "cc_progress": "阶段3 · Claude Code 进度",
     "cc_delivery": "阶段3 · Claude Code 交卷",
     "verifier_audit": "阶段4 · Post-Verifier 独立终审",
+    "rework": "阶段4 · 打回返工",
     "rework_to_cc": "阶段4 · 打回 Claude Code 返工",
     "ux_walkthrough": "阶段5 · 真实用户视角体验",
     "signoff": "阶段6 · 终审放行与结项汇报",
+    "escalate": "异常停机 · 升级用户裁决",
+    "abort": "用户中止 · 闭环取消",
     "roster_set": "角色编排 · 更新 Harness/模型分工",
     "cross_consult": "跨端咨询 · 发起只读评审/取经",
     "cross_feedback": "跨端反馈 · 收到只读建议",
@@ -496,6 +505,8 @@ def ensure_manifest_v2(manifest: dict[str, Any]) -> dict[str, Any]:
     if manifest.get("cc_jsonl_path") and not sessions["claude"].get("jsonl_path"):
         sessions["claude"]["jsonl_path"] = manifest["cc_jsonl_path"]
 
+    manifest.setdefault("max_rounds", DEFAULT_MAX_ROUNDS)
+    manifest.setdefault("terminal_reason", "")
     manifest.setdefault("jobs", [])
     manifest.setdefault("tmux_session", "")
     manifest.setdefault("synced_cc_assistant_ts", [])
@@ -738,10 +749,12 @@ def render_dialogue(repo: Path, run_dir: Path) -> Path:
     complexity = manifest.get("complexity") or "complex"
     mode_label = "complex (ultracode)" if complexity == "complex" else "simple"
 
+    term_reason = str(manifest.get("terminal_reason") or "").strip()
+    term_part = f" · **终止原因**：`{term_reason}`" if term_reason else ""
     lines: list[str] = [
         f"# 多 Harness 闭环对话台账 · {manifest.get('slug', '')}",
         "",
-        f"> **Run ID**：`{manifest.get('run_id')}` · **复杂度/模式**：`{mode_label}` · **当前阶段**：`{manifest.get('phase')}` · **终审结论**：`{manifest.get('verdict')}` · **返工轮次**：`{manifest.get('round', 0)}` · **更新**：`{manifest.get('updated_at')}`",
+        f"> **Run ID**：`{manifest.get('run_id')}` · **复杂度/模式**：`{mode_label}` · **当前阶段**：`{manifest.get('phase')}` · **终审结论**：`{manifest.get('verdict')}` · **返工轮次**：`{manifest.get('round', 0)}/{manifest.get('max_rounds', DEFAULT_MAX_ROUNDS)}`{term_part} · **更新**：`{manifest.get('updated_at')}`",
         "",
         "## 当前角色花名册（Role Roster）",
         "",
@@ -862,6 +875,7 @@ def append_event(
     body: str,
     phase: str | None = None,
     verdict: str | None = None,
+    terminal_reason: str | None = None,
     commits: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -872,7 +886,9 @@ def append_event(
             manifest["phase"] = phase
         if verdict:
             manifest["verdict"] = verdict
-        if event == "rework_to_cc":
+        if terminal_reason is not None:
+            manifest["terminal_reason"] = terminal_reason
+        if event in ("rework_to_cc", "rework"):
             manifest["round"] = int(manifest.get("round", 0)) + 1
 
         entry: dict[str, Any] = {
@@ -2340,6 +2356,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "updated_at": now_iso(),
         "phase": "SPEC_AND_HANDOFF",
         "round": 0,
+        "max_rounds": max(int(getattr(args, "max_rounds", DEFAULT_MAX_ROUNDS)), 0),
+        "terminal_reason": "",
         "verdict": "PENDING",
         "base_commit": base_commit,
         "tmux_session": tmux_sess,
@@ -2524,10 +2542,191 @@ def cmd_bind_session(args: argparse.Namespace) -> int:
     return 0
 
 
+def _safe_resolve_path(raw: str) -> str:
+    """Resolve a path string safely even if the target directory was deleted."""
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        return ""
+    try:
+        return str(Path(cleaned).resolve())
+    except OSError:
+        return cleaned
+
+
+def _evaluate_signoff_gate(
+    manifest: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    skip_ux: bool = False,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Enforce hard completion checks before recording signoff (DONE)."""
+    blockers: list[str] = []
+
+    cur_verdict = str(manifest.get("verdict") or "PENDING")
+    if cur_verdict != "PASS":
+        blockers.append(f"终审结论当前为 {cur_verdict}，需先通过 verifier_audit 并记录 --verdict PASS")
+
+    jobs = [j for j in (manifest.get("jobs") or []) if isinstance(j, dict)]
+    terminal_set = {"COMPLETED", "BLOCKED_OR_FAILED", "PROCESS_EXITED_FAILED", "STALLED", "STOPPED"}
+    completed_idx_by_workdir: dict[str, int] = {}
+    completed_idx_by_label: dict[str, int] = {}
+    job_statuses: list[str] = []
+
+    for idx, j in enumerate(jobs):
+        st = _summarize_job_status(j)
+        job_statuses.append(st)
+        if st == "COMPLETED":
+            wd = _safe_resolve_path(str(j.get("workdir") or ""))
+            lbl = str(j.get("label") or "").strip()
+            if wd:
+                completed_idx_by_workdir[wd] = idx
+            if lbl:
+                completed_idx_by_label[lbl] = idx
+
+    active_jobs: list[str] = []
+    unresolved_failed_jobs: list[str] = []
+    for idx, (j, st) in enumerate(zip(jobs, job_statuses)):
+        jid = str(j.get("job_id") or "-")
+        if st not in terminal_set:
+            active_jobs.append(f"{jid}({st})")
+        elif st in ("BLOCKED_OR_FAILED", "PROCESS_EXITED_FAILED", "STALLED"):
+            wd = _safe_resolve_path(str(j.get("workdir") or ""))
+            lbl = str(j.get("label") or "").strip()
+            superseded = (wd and completed_idx_by_workdir.get(wd, -1) > idx) or (
+                lbl and completed_idx_by_label.get(lbl, -1) > idx
+            )
+            if not superseded:
+                unresolved_failed_jobs.append(f"{jid}({st})")
+
+    if active_jobs:
+        blockers.append(f"仍有活跃或未结束任务: {', '.join(active_jobs)}")
+    if unresolved_failed_jobs:
+        blockers.append(f"存在未闭环的失败/卡死任务: {', '.join(unresolved_failed_jobs)}")
+
+    write_dispatch_events = ("delegate_task", "rework", "rework_to_cc", "handoff_to_cc")
+    last_dispatch_idx = -1
+    for idx, ev in enumerate(events):
+        if ev.get("event") in write_dispatch_events:
+            last_dispatch_idx = idx
+    has_ux = any(ev.get("event") == "ux_walkthrough" for ev in events[last_dispatch_idx + 1 :])
+    if not skip_ux and not has_ux:
+        blockers.append("缺少本轮实机体验记录 (event=ux_walkthrough)；纯后端/脚本任务可显式传 --skip-ux")
+
+    details = {
+        "verdict": cur_verdict,
+        "active_jobs": active_jobs,
+        "unresolved_failed_jobs": unresolved_failed_jobs,
+        "has_ux_walkthrough": has_ux,
+        "skip_ux": skip_ux,
+    }
+    return len(blockers) == 0, blockers, details
+
+
+def _enforce_dispatch_loop_guards(
+    repo: Path,
+    run_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    from_role: str,
+    is_rework: bool,
+    force: bool,
+    dry_run: bool,
+) -> tuple[bool, int | None]:
+    """Block dispatching on terminal runs or past max_rounds unless --force is passed."""
+    cur_phase = str(manifest.get("phase") or "")
+    if cur_phase in TERMINAL_PHASES and not force:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "dispatched": False,
+                    "reason": "run_already_terminal",
+                    "phase": cur_phase,
+                    "terminal_reason": manifest.get("terminal_reason", ""),
+                    "hint": "当前闭环已处于终态，需用户确认后加 --force 才能重新派活。",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return False, 2
+
+    if is_rework:
+        cur_round = int(manifest.get("round", 0))
+        max_rounds = int(manifest.get("max_rounds", DEFAULT_MAX_ROUNDS))
+        if cur_round >= max_rounds and not force:
+            if not dry_run:
+                append_event(
+                    repo,
+                    run_dir,
+                    role=from_role,
+                    event="escalate",
+                    summary=f"达到自动返工上限 ({cur_round}/{max_rounds})，强制停机升级用户裁决",
+                    body=f"自动返工轮次已达上限 ({cur_round}/{max_rounds})，停止继续自动打回，等待用户决策或明确授权 --force。",
+                    phase="ESCALATED",
+                    terminal_reason=f"auto_rework_cap ({cur_round}/{max_rounds})",
+                )
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "dispatched": False,
+                        "reason": "max_rework_rounds_reached",
+                        "round": cur_round,
+                        "max_rounds": max_rounds,
+                        "phase": "ESCALATED" if not dry_run else cur_phase,
+                        "hint": "已达自动返工上限，请升级用户决定，或经用户授权后加 --force 放行。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return False, 2
+
+    return True, None
+
+
 def cmd_record(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     run_dir = resolve_run_dir(repo, args.run_id)
     body = read_prompt_or_body(args.body, args.body_file)
+    phase = args.phase
+    terminal_reason: str | None = None
+    extra: dict[str, Any] = {}
+
+    if args.event == "signoff":
+        manifest = load_manifest(run_dir)
+        events = load_events(run_dir)
+        skip_ux = bool(getattr(args, "skip_ux", False))
+        force = bool(getattr(args, "force", False))
+        ok_gate, blockers, gate_details = _evaluate_signoff_gate(manifest, events, skip_ux=skip_ux)
+        if not ok_gate and not force:
+            err_payload = {
+                "ok": False,
+                "reason": "signoff_gate_failed",
+                "blockers": blockers,
+                "details": gate_details,
+            }
+            if args.json:
+                print(json.dumps(err_payload, ensure_ascii=False, indent=2))
+            else:
+                print("[signoff 拦截] 尚不满足闭环结束条件：")
+                for b in blockers:
+                    print(f"  - {b}")
+            return 2
+        phase = phase or "DONE"
+        terminal_reason = "completed"
+        if skip_ux:
+            extra["ux_skipped"] = True
+        if force and not ok_gate:
+            extra["forced_signoff"] = True
+    elif args.event == "escalate":
+        phase = phase or "ESCALATED"
+        terminal_reason = args.summary
+    elif args.event == "abort":
+        phase = phase or "ABORTED"
+        terminal_reason = args.summary
+
     entry = append_event(
         repo,
         run_dir,
@@ -2535,9 +2734,11 @@ def cmd_record(args: argparse.Namespace) -> int:
         event=args.event,
         summary=args.summary,
         body=body,
-        phase=args.phase,
+        phase=phase,
         verdict=args.verdict,
+        terminal_reason=terminal_reason,
         commits=args.commits,
+        extra=extra or None,
     )
     if args.json:
         print(json.dumps({"ok": True, "event": entry}, ensure_ascii=False, indent=2))
@@ -2662,6 +2863,19 @@ def cmd_send_cc(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     run_dir = resolve_run_dir(repo, args.run_id)
     manifest = load_manifest(run_dir)
+    is_rework = args.event == "rework_to_cc"
+    ok_guard, guard_rc = _enforce_dispatch_loop_guards(
+        repo,
+        run_dir,
+        manifest,
+        from_role="agy",
+        is_rework=is_rework,
+        force=bool(getattr(args, "force", False)),
+        dry_run=bool(args.dry_run),
+    )
+    if not ok_guard:
+        return int(guard_rc or 2)
+
     prompt_text = read_prompt_or_body(args.prompt, args.prompt_file)
     if not prompt_text.strip():
         print(json.dumps({"ok": False, "error": "empty prompt"}, ensure_ascii=False), file=sys.stderr)
@@ -2675,10 +2889,11 @@ def cmd_send_cc(args: argparse.Namespace) -> int:
     use_ultracode = args.ultracode if args.ultracode is not None else default_ultra
     prompt_text = apply_ultracode_prefix(prompt_text, use_ultracode)
 
-    round_num = int(manifest.get("round", 0)) + (1 if args.event == "rework_to_cc" else 0)
+    round_num = int(manifest.get("round", 0)) + (1 if is_rework else 0)
     prompt_file = run_dir / f"ROUND-{round_num}-PROMPT.md"
     prompt_file.write_text(prompt_text, encoding="utf-8")
 
+    send_verdict = "NEEDS_FIX" if is_rework else ("PENDING" if manifest.get("verdict") == "PASS" else None)
     append_event(
         repo,
         run_dir,
@@ -2687,7 +2902,8 @@ def cmd_send_cc(args: argparse.Namespace) -> int:
         summary=args.summary or f"第 {round_num} 轮指令发送给 Claude Code",
         body=prompt_text,
         phase="CC_EXECUTING",
-        verdict="NEEDS_FIX" if args.event == "rework_to_cc" else None,
+        verdict=send_verdict,
+        terminal_reason="",
     )
 
     sid = args.session_id or manifest.get("cc_session_id") or ""
@@ -3107,6 +3323,19 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     run_dir = resolve_run_dir(repo, args.run_id)
     manifest = load_manifest(run_dir)
+    is_rework = bool(getattr(args, "rework", False))
+    ok_guard, guard_rc = _enforce_dispatch_loop_guards(
+        repo,
+        run_dir,
+        manifest,
+        from_role=args.from_role,
+        is_rework=is_rework,
+        force=bool(args.force),
+        dry_run=bool(args.dry_run),
+    )
+    if not ok_guard:
+        return int(guard_rc or 2)
+
     track = (getattr(args, "track", "") or "").strip()
 
     to_harness = (getattr(args, "to", "") or "").strip().lower()
@@ -3193,15 +3422,25 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     sock_flag = f"-L {sock} " if sock else ""
     win_name = sanitize_tmux_name(label or track or f"{to_harness}-{args.role_name}", max_len=18)
 
+    next_round = int(manifest.get("round", 0)) + (1 if is_rework else 0)
     phase_hint = "CC_EXECUTING" if to_harness == "claude" else f"{to_harness.upper()}_EXECUTING"
+    del_event = "rework" if is_rework else "delegate_task"
+    del_verdict = "NEEDS_FIX" if is_rework else ("PENDING" if manifest.get("verdict") == "PASS" else None)
+    default_summary = (
+        f"{args.from_role} 发起第 {next_round} 轮返工 ({label or track or args.role_name}) 给 {to_harness}"
+        if is_rework
+        else f"{args.from_role} 派发 {label or track or args.role_name} 任务给 {to_harness}"
+    )
     append_event(
         repo,
         run_dir,
         role=args.from_role,
-        event="delegate_task",
-        summary=args.summary or f"{args.from_role} 派发 {label or track or args.role_name} 任务给 {to_harness}",
+        event=del_event,
+        summary=args.summary or default_summary,
         body=prompt_text,
         phase=phase_hint,
+        verdict=del_verdict,
+        terminal_reason="",
         extra={
             "target": to_harness,
             "model": model,
@@ -3211,6 +3450,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "wave": wave,
             "track": track,
             "job_id": job_id,
+            "rework": is_rework,
+            "round": next_round,
         },
     )
 
@@ -3223,6 +3464,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "from": args.from_role,
             "to": to_harness,
             "role_name": args.role_name,
+            "rework": is_rework,
+            "round": next_round,
             "track": track,
             "wave": wave,
             "label": label,
@@ -3378,6 +3621,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "background": True,
             "harness": "claude",
             "job_id": job_id,
+            "rework": is_rework,
+            "round": next_round,
             "job": job_meta,
             "workdir": str(workdir),
             "branch": branch,
@@ -3487,6 +3732,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "background": True,
             "harness": to_harness,
             "job_id": job_id,
+            "rework": is_rework,
+            "round": next_round,
             "job": job_meta,
             "dialogue_md": str(run_dir / DIALOGUE_FILE),
         }
@@ -3635,6 +3882,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         "background": False,
         "harness": to_harness,
         "job_id": job_id,
+        "rework": is_rework,
+        "round": next_round,
         "workdir": str(workdir),
         "model": model,
         "session_id": final_sid,
@@ -5330,6 +5579,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         "phase": manifest.get("phase"),
         "verdict": manifest.get("verdict"),
         "round": manifest.get("round"),
+        "max_rounds": manifest.get("max_rounds", DEFAULT_MAX_ROUNDS),
+        "terminal_reason": manifest.get("terminal_reason", ""),
         "base_commit": manifest.get("base_commit"),
         "current_head": git_head_short(repo),
         "tmux_session": default_tmux_session_name(manifest, repo),
@@ -5521,6 +5772,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--advisor", default="")
     p_init.add_argument("--track", action="append", default=None, help="Bind named track (<name>=<harness>[:<model>])")
     p_init.add_argument("--tmux-session", default="")
+    p_init.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS)
     p_init.add_argument("--json", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
@@ -5569,6 +5821,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument("--body", default="")
     p_rec.add_argument("--body-file", default="")
     p_rec.add_argument("--commits", default="")
+    p_rec.add_argument("--skip-ux", action="store_true")
+    p_rec.add_argument("--force", action="store_true")
     p_rec.add_argument("--json", action="store_true")
     p_rec.set_defaults(func=cmd_record)
 
@@ -5594,6 +5848,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--summary", default="")
     p_send.add_argument("--cmux-target", default="")
     _add_ultracode_args(p_send)
+    p_send.add_argument("--force", action="store_true")
     p_send.add_argument("--dry-run", action="store_true")
     p_send.add_argument("--json", action="store_true")
     p_send.set_defaults(func=cmd_send_cc)
@@ -5640,6 +5895,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode_grp.add_argument("--sync", dest="sync", action="store_true")
     p_del.add_argument("--sandbox", choices=("workspace-write", "danger-full-access"), default="workspace-write")
     p_del.add_argument("--timeout", type=int, default=600)
+    p_del.add_argument("--rework", action="store_true")
     p_del.add_argument("--force", action="store_true")
     p_del.add_argument("--allow-nested", action="store_true")
     p_del.add_argument("--dry-run", action="store_true")

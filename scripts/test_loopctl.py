@@ -682,5 +682,243 @@ class V2WorktreeTmuxAndViewTests(unittest.TestCase):
             self.assertIn("Codex batch verified cleanly.", codex_view)
 
 
+class ExitCriteriaAndGatesTests(unittest.TestCase):
+    def test_rework_round_cap_escalation_and_abort(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_home = root / "home"
+            fake_home.mkdir()
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "README.md").write_text("init\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "chore: init"], cwd=repo, check=True)
+            env = dict(os.environ, HOME=str(fake_home))
+
+            init_out = json.loads(
+                subprocess.check_output(
+                    [sys.executable, "-B", str(LOOPCTL_PATH), "init", "--repo", str(repo), "--slug", "exit-cap", "--max-rounds", "2", "--json"],
+                    env=env, text=True,
+                )
+            )
+            self.assertEqual(init_out["manifest"]["max_rounds"], 2)
+
+            r1 = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                        "--repo", str(repo), "--from", "agy", "--to", "codex",
+                        "--rework", "--prompt", "fix 1", "--dry-run", "--json",
+                    ],
+                    env=env, text=True,
+                )
+            )
+            self.assertTrue(r1["rework"])
+            self.assertEqual(r1["round"], 1)
+
+            r2 = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                        "--repo", str(repo), "--from", "agy", "--to", "claude",
+                        "--rework", "--prompt", "fix 2", "--dry-run", "--json",
+                    ],
+                    env=env, text=True,
+                )
+            )
+            self.assertEqual(r2["round"], 2)
+
+            st_mid = json.loads(
+                subprocess.check_output([sys.executable, "-B", str(LOOPCTL_PATH), "status", "--repo", str(repo)], env=env, text=True)
+            )
+            self.assertEqual(st_mid["round"], 2)
+            self.assertEqual(st_mid["verdict"], "NEEDS_FIX")
+
+            r3 = subprocess.run(
+                [
+                    sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                    "--repo", str(repo), "--from", "agy", "--to", "codex",
+                    "--rework", "--prompt", "fix 3", "--json",
+                ],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(r3.returncode, 2, r3.stdout + r3.stderr)
+            r3_data = json.loads(r3.stdout)
+            self.assertEqual(r3_data["reason"], "max_rework_rounds_reached")
+            self.assertEqual(r3_data["phase"], "ESCALATED")
+
+            st_esc = json.loads(
+                subprocess.check_output([sys.executable, "-B", str(LOOPCTL_PATH), "status", "--repo", str(repo)], env=env, text=True)
+            )
+            self.assertEqual(st_esc["phase"], "ESCALATED")
+            self.assertIn("auto_rework_cap", st_esc["terminal_reason"])
+
+            blocked_norm = subprocess.run(
+                [
+                    sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                    "--repo", str(repo), "--from", "agy", "--to", "codex",
+                    "--prompt", "resume blocked", "--dry-run", "--json",
+                ],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(blocked_norm.returncode, 2, blocked_norm.stdout)
+            self.assertEqual(json.loads(blocked_norm.stdout)["reason"], "run_already_terminal")
+
+            forced = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                        "--repo", str(repo), "--from", "agy", "--to", "codex",
+                        "--rework", "--force", "--prompt", "fix 3 forced", "--dry-run", "--json",
+                    ],
+                    env=env, text=True,
+                )
+            )
+            self.assertEqual(forced["round"], 3)
+
+            subprocess.run(
+                [
+                    sys.executable, "-B", str(LOOPCTL_PATH), "record",
+                    "--repo", str(repo), "--role", "agy", "--event", "escalate",
+                    "--summary", "need user choice", "--json",
+                ],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+            st_esc2 = json.loads(
+                subprocess.check_output([sys.executable, "-B", str(LOOPCTL_PATH), "status", "--repo", str(repo)], env=env, text=True)
+            )
+            self.assertEqual(st_esc2["phase"], "ESCALATED")
+            self.assertEqual(st_esc2["terminal_reason"], "need user choice")
+
+            subprocess.run(
+                [
+                    sys.executable, "-B", str(LOOPCTL_PATH), "record",
+                    "--repo", str(repo), "--role", "user", "--event", "abort",
+                    "--summary", "user stopped", "--json",
+                ],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+            st_abt = json.loads(
+                subprocess.check_output([sys.executable, "-B", str(LOOPCTL_PATH), "status", "--repo", str(repo)], env=env, text=True)
+            )
+            self.assertEqual(st_abt["phase"], "ABORTED")
+            self.assertEqual(st_abt["terminal_reason"], "user stopped")
+
+    def test_signoff_exit_gate_and_stale_pass_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_home = root / "home"
+            fake_home.mkdir()
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            (repo / "README.md").write_text("init\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "chore: init"], cwd=repo, check=True)
+            env = dict(os.environ, HOME=str(fake_home))
+
+            subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "init", "--repo", str(repo), "--slug", "gate-run", "--json"],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+
+            s_fail1 = subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "record", "--repo", str(repo), "--role", "agy", "--event", "signoff", "--summary", "done?", "--json"],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(s_fail1.returncode, 2)
+            d1 = json.loads(s_fail1.stdout)
+            self.assertEqual(d1["reason"], "signoff_gate_failed")
+            self.assertEqual(len(d1["blockers"]), 2)
+
+            subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "record", "--repo", str(repo), "--role", "agy", "--event", "verifier_audit", "--verdict", "PASS", "--summary", "all clear", "--json"],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+            s_fail2 = subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "record", "--repo", str(repo), "--role", "agy", "--event", "signoff", "--summary", "done?", "--json"],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(s_fail2.returncode, 2)
+            self.assertIn("ux_walkthrough", " ".join(json.loads(s_fail2.stdout)["blockers"]))
+
+            subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "record", "--repo", str(repo), "--role", "agy", "--event", "signoff", "--skip-ux", "--summary", "cli complete", "--json"],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+            st_done = json.loads(
+                subprocess.check_output([sys.executable, "-B", str(LOOPCTL_PATH), "status", "--repo", str(repo)], env=env, text=True)
+            )
+            self.assertEqual(st_done["phase"], "DONE")
+            self.assertEqual(st_done["terminal_reason"], "completed")
+
+            subprocess.run(
+                [
+                    sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                    "--repo", str(repo), "--from", "agy", "--to", "codex",
+                    "--force", "--prompt", "next wave", "--dry-run", "--json",
+                ],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+            st_reset = json.loads(
+                subprocess.check_output([sys.executable, "-B", str(LOOPCTL_PATH), "status", "--repo", str(repo)], env=env, text=True)
+            )
+            self.assertEqual(st_reset["verdict"], "PENDING")
+            self.assertEqual(st_reset["terminal_reason"], "")
+
+            init2 = json.loads(
+                subprocess.check_output(
+                    [sys.executable, "-B", str(LOOPCTL_PATH), "init", "--repo", str(repo), "--slug", "jobs-gate", "--json"],
+                    env=env, text=True,
+                )
+            )
+            run_dir2 = Path(init2["run_dir"])
+            subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "record", "--repo", str(repo), "--role", "agy", "--event", "verifier_audit", "--verdict", "PASS", "--summary", "pass", "--json"],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "record", "--repo", str(repo), "--role", "agy", "--event", "ux_walkthrough", "--summary", "ux ok", "--json"],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+
+            m_path = run_dir2 / "manifest.json"
+            m_data = json.loads(m_path.read_text(encoding="utf-8"))
+            wt1 = str((root / "wt1").resolve())
+            wt2 = str((root / "wt2").resolve())
+            m_data["jobs"] = [
+                {"job_id": "j-fail", "workdir": wt1, "label": "w1", "status": "PROCESS_EXITED_FAILED"},
+                {"job_id": "j-run", "workdir": wt2, "label": "w2", "status": "RUNNING", "pid": os.getpid()},
+            ]
+            m_path.write_text(json.dumps(m_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            s_fail3 = subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "record", "--repo", str(repo), "--role", "agy", "--event", "signoff", "--summary", "try", "--json"],
+                env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(s_fail3.returncode, 2)
+            d3 = json.loads(s_fail3.stdout)
+            self.assertTrue(d3["details"]["active_jobs"])
+            self.assertTrue(d3["details"]["unresolved_failed_jobs"])
+
+            m_data["jobs"][1]["status"] = "COMPLETED"
+            m_data["jobs"].append({"job_id": "j-retry-ok", "workdir": wt1, "label": "w1", "status": "COMPLETED"})
+            m_path.write_text(json.dumps(m_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "record", "--repo", str(repo), "--role", "agy", "--event", "signoff", "--summary", "all superseded & done", "--json"],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+            st_done2 = json.loads(
+                subprocess.check_output([sys.executable, "-B", str(LOOPCTL_PATH), "status", "--repo", str(repo)], env=env, text=True)
+            )
+            self.assertEqual(st_done2["phase"], "DONE")
+
+
 if __name__ == "__main__":
     unittest.main()

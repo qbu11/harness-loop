@@ -158,7 +158,7 @@ python3 ~/.agents/skills/harness-loop/scripts/loopctl.py record --repo "<repo_pa
 
 ---
 
-## 4. Post-Verifier 返工提示词模板（`NEEDS_FIX`）
+## 4. Post-Verifier 返工提示词模板（`NEEDS_FIX`，由 `delegate --rework` 派发）
 
 ```text
 Post-Verifier 独立审查发现以下问题，请在 `<workdir>` 逐条修复并复验：
