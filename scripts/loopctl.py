@@ -28,6 +28,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import quota_router  # noqa: E402
+
 
 SKILL_NAME = "harness-loop"
 LOOP_DIR_NAME = ".agent-loop"
@@ -507,6 +512,13 @@ def ensure_manifest_v2(manifest: dict[str, Any]) -> dict[str, Any]:
 
     manifest.setdefault("max_rounds", DEFAULT_MAX_ROUNDS)
     manifest.setdefault("terminal_reason", "")
+    qpol = manifest.setdefault("quota_policy", {})
+    if isinstance(qpol, dict):
+        qpol.setdefault("conserve", [])
+        qpol.setdefault("prefer", [])
+        qpol.setdefault("strategy", "auto")
+        qpol.setdefault("probe", "auto")
+        qpol.setdefault("brief", False)
     manifest.setdefault("jobs", [])
     manifest.setdefault("tmux_session", "")
     manifest.setdefault("synced_cc_assistant_ts", [])
@@ -751,10 +763,22 @@ def render_dialogue(repo: Path, run_dir: Path) -> Path:
 
     term_reason = str(manifest.get("terminal_reason") or "").strip()
     term_part = f" · **终止原因**：`{term_reason}`" if term_reason else ""
+    qpol = manifest.get("quota_policy") if isinstance(manifest.get("quota_policy"), dict) else {}
+    q_parts: list[str] = []
+    if qpol.get("conserve"):
+        q_parts.append("省=" + ",".join(qpol["conserve"]))
+    if qpol.get("prefer"):
+        q_parts.append("先烧=" + ",".join(qpol["prefer"]))
+    if qpol.get("strategy") and qpol.get("strategy") != "auto":
+        q_parts.append("策略=" + str(qpol["strategy"]))
+    if qpol.get("brief"):
+        q_parts.append("精简输出=on")
+    q_line = [f"> **额度路由策略**：{' · '.join(q_parts)}"] if q_parts else []
     lines: list[str] = [
         f"# 多 Harness 闭环对话台账 · {manifest.get('slug', '')}",
         "",
         f"> **Run ID**：`{manifest.get('run_id')}` · **复杂度/模式**：`{mode_label}` · **当前阶段**：`{manifest.get('phase')}` · **终审结论**：`{manifest.get('verdict')}` · **返工轮次**：`{manifest.get('round', 0)}/{manifest.get('max_rounds', DEFAULT_MAX_ROUNDS)}`{term_part} · **更新**：`{manifest.get('updated_at')}`",
+        *q_line,
         "",
         "## 当前角色花名册（Role Roster）",
         "",
@@ -2302,6 +2326,100 @@ def extract_reply_and_session(
     return stripped, sid
 
 
+def _parse_csv_harnesses(raw: str | None) -> list[str]:
+    """Parse comma-separated harness names cleanly while preserving order."""
+    out: list[str] = []
+    for part in (raw or "").split(","):
+        cleaned = part.strip().lower()
+        if not cleaned:
+            continue
+        if cleaned not in HARNESSES:
+            raise ValueError(f"Unsupported harness {cleaned!r}; choose from {', '.join(HARNESSES)}")
+        if cleaned not in out:
+            out.append(cleaned)
+    return out
+
+
+def _binary_availability() -> dict[str, bool]:
+    return {
+        "agy": bool(agy_bin()),
+        "claude": bool(claude_bin()),
+        "codex": bool(codex_bin()),
+    }
+
+
+def _apply_quota_policy_to_manifest(
+    manifest: dict[str, Any],
+    *,
+    repo: Path,
+    conserve: list[str] | None = None,
+    prefer: list[str] | None = None,
+    strategy: str | None = None,
+    probe: str | None = None,
+    brief: bool | None = None,
+    auto_roster: bool = False,
+    probe_cmd: str = "",
+    snapshot_path: Path | None = None,
+) -> dict[str, Any] | None:
+    """Update manifest quota_policy and optionally apply quota-driven role/track assignments."""
+    qpol = manifest.setdefault("quota_policy", {})
+    if conserve is not None:
+        qpol["conserve"] = conserve
+    if prefer is not None:
+        qpol["prefer"] = prefer
+    if strategy is not None:
+        qpol["strategy"] = strategy
+    if probe is not None:
+        qpol["probe"] = probe
+    if brief is not None:
+        qpol["brief"] = brief
+
+    if not auto_roster:
+        return None
+
+    collected = quota_router.collect_quota_state(
+        repo=repo,
+        probe=str(qpol.get("probe") or "auto"),
+        probe_cmd=probe_cmd,
+        snapshot_path=snapshot_path,
+        binaries_available=_binary_availability(),
+    )
+    ranked = quota_router.score_harnesses(
+        collected,
+        conserve=qpol.get("conserve") or [],
+        prefer=qpol.get("prefer") or [],
+        strategy=str(qpol.get("strategy") or "auto"),
+    )
+    rec = quota_router.recommend_roster(
+        ranked,
+        conserve=qpol.get("conserve") or [],
+        prefer=qpol.get("prefer") or [],
+        strategy=str(qpol.get("strategy") or "auto"),
+    )
+
+    roster = manifest.setdefault("roster", {})
+    sessions = manifest.setdefault("sessions", default_sessions_dict())
+    for role_key in ("executor", "advisor", "verifier"):
+        new_h = rec.get(role_key)
+        if not new_h:
+            continue
+        prev = roster.get(role_key) if isinstance(roster.get(role_key), dict) else {}
+        keep_model = str(prev.get("model") or "") if prev.get("harness") == new_h else ""
+        roster[role_key] = {"harness": new_h, "model": keep_model}
+
+    tracks = roster.setdefault("tracks", {})
+    for t_name, t_h in (rec.get("tracks") or {}).items():
+        if t_h in HARNESSES:
+            prev_t = tracks.get(t_name) if isinstance(tracks.get(t_name), dict) else {}
+            keep_m = str(prev_t.get("model") or "") if prev_t.get("harness") == t_h else ""
+            tracks[t_name] = {"harness": t_h, "model": keep_m}
+
+    if brief is None and rec.get("brief_recommended"):
+        qpol["brief"] = True
+
+    return {"collected": collected, "ranked": ranked, "recommendation": rec}
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     ensure_loop_root(repo)
@@ -2362,6 +2480,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         "base_commit": base_commit,
         "tmux_session": tmux_sess,
         "roster": roster,
+        "quota_policy": {
+            "conserve": _parse_csv_harnesses(getattr(args, "conserve", "")),
+            "prefer": _parse_csv_harnesses(getattr(args, "prefer", "")),
+            "strategy": getattr(args, "quota_strategy", "auto") or "auto",
+            "probe": getattr(args, "probe", "auto") or "auto",
+            "brief": bool(getattr(args, "brief", False)) if getattr(args, "brief", None) is not None else False,
+        },
         "sessions": sessions,
         "jobs": [],
         "agy_conversation_id": agy_id,
@@ -2375,12 +2500,23 @@ def cmd_init(args: argparse.Namespace) -> int:
         "synced_cc_assistant_ts": [],
         "synced_codex_ts": [],
     }
+    snap_p = Path(args.snapshot).expanduser().resolve() if getattr(args, "snapshot", "") else None
+    quota_res = _apply_quota_policy_to_manifest(
+        manifest,
+        repo=repo,
+        brief=getattr(args, "brief", None),
+        auto_roster=bool(getattr(args, "auto_roster", False)),
+        probe_cmd=getattr(args, "probe_cmd", "") or "",
+        snapshot_path=snap_p,
+    )
     save_manifest(run_dir, manifest)
     (run_dir / EVENTS_FILE).touch(exist_ok=True)
     _atomic_write_text(repo / LOOP_DIR_NAME / LATEST_RUN_FILE, run_id + "\n")
     dialogue_path = render_dialogue(repo, run_dir)
 
-    out = {"ok": True, "run_id": run_id, "run_dir": str(run_dir), "dialogue_md": str(dialogue_path), "manifest": manifest}
+    out: dict[str, Any] = {"ok": True, "run_id": run_id, "run_dir": str(run_dir), "dialogue_md": str(dialogue_path), "manifest": manifest}
+    if quota_res:
+        out["quota_recommendation"] = quota_res["recommendation"]
     print(json.dumps(out, ensure_ascii=False, indent=2) if args.json else str(dialogue_path))
     return 0
 
@@ -2405,23 +2541,62 @@ def cmd_set_roster(args: argparse.Namespace) -> int:
             if t_spec["model"]:
                 manifest["sessions"][t_spec["harness"]]["model"] = t_spec["model"]
             changes[f"track:{t_name}"] = t_spec
+
+        con_val = _parse_csv_harnesses(args.conserve) if getattr(args, "conserve", "") else None
+        pref_val = _parse_csv_harnesses(args.prefer) if getattr(args, "prefer", "") else None
+        strat_val = getattr(args, "quota_strategy", "") or None
+        probe_val = getattr(args, "probe", "") or None
+        brief_val = getattr(args, "brief", None)
+        auto_roster = bool(getattr(args, "auto_roster", False))
+        snap_p = Path(args.snapshot).expanduser().resolve() if getattr(args, "snapshot", "") else None
+
+        quota_res = None
+        if any(x is not None for x in (con_val, pref_val, strat_val, probe_val, brief_val)) or auto_roster:
+            quota_res = _apply_quota_policy_to_manifest(
+                manifest,
+                repo=repo,
+                conserve=con_val,
+                prefer=pref_val,
+                strategy=strat_val,
+                probe=probe_val,
+                brief=brief_val,
+                auto_roster=auto_roster,
+                probe_cmd=getattr(args, "probe_cmd", "") or "",
+                snapshot_path=snap_p,
+            )
+            changes["quota_policy"] = manifest["quota_policy"]
+            if quota_res:
+                changes["auto_executor"] = manifest["roster"].get("executor")
+
         if not changes:
-            print(json.dumps({"ok": False, "error": "no roster role or track flags provided"}, ensure_ascii=False), file=sys.stderr)
+            print(json.dumps({"ok": False, "error": "no roster, track, or quota policy flags provided"}, ensure_ascii=False), file=sys.stderr)
             return 1
         save_manifest(run_dir, manifest)
-    summary = "更新角色分工：" + ", ".join(
-        f"{k}={v['harness']}" + (f"({v['model']})" if v["model"] else "")
-        for k, v in changes.items()
-    )
+
+    desc_parts: list[str] = []
+    for k, v in changes.items():
+        if isinstance(v, dict) and "harness" in v:
+            desc_parts.append(f"{k}={v['harness']}" + (f"({v['model']})" if v.get("model") else ""))
+        else:
+            desc_parts.append(f"{k}={json.dumps(v, ensure_ascii=False)}")
+    summary = "更新角色分工：" + ", ".join(desc_parts)
     append_event(
         repo,
         run_dir,
         role=args.role,
         event="roster_set",
         summary=summary,
-        body=json.dumps(manifest["roster"], ensure_ascii=False, indent=2),
+        body=json.dumps({"roster": manifest["roster"], "quota_policy": manifest["quota_policy"]}, ensure_ascii=False, indent=2),
     )
-    out = {"ok": True, "run_id": manifest["run_id"], "roster": manifest["roster"], "dialogue_md": str(run_dir / DIALOGUE_FILE)}
+    out: dict[str, Any] = {
+        "ok": True,
+        "run_id": manifest["run_id"],
+        "roster": manifest["roster"],
+        "quota_policy": manifest["quota_policy"],
+        "dialogue_md": str(run_dir / DIALOGUE_FILE),
+    }
+    if quota_res:
+        out["quota_recommendation"] = quota_res["recommendation"]
     print(json.dumps(out, ensure_ascii=False, indent=2) if args.json else summary)
     return 0
 
@@ -3339,14 +3514,45 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     track = (getattr(args, "track", "") or "").strip()
 
     to_harness = (getattr(args, "to", "") or "").strip().lower()
+    routing_source = "explicit" if to_harness else ""
     if not to_harness and track:
         t_spec = (manifest.get("roster") or {}).get("tracks", {}).get(track)
         if isinstance(t_spec, dict) and t_spec.get("harness"):
             to_harness = str(t_spec["harness"])
+            routing_source = f"track:{track}"
+    qpol = manifest.get("quota_policy") if isinstance(manifest.get("quota_policy"), dict) else {}
+    if not to_harness and (
+        getattr(args, "auto_route", False)
+        or qpol.get("conserve")
+        or qpol.get("prefer")
+        or str(qpol.get("strategy") or "auto") != "auto"
+    ):
+        collected = quota_router.collect_quota_state(
+            repo=repo,
+            probe=str(qpol.get("probe") or "auto"),
+            binaries_available=_binary_availability(),
+        )
+        ranked = quota_router.score_harnesses(
+            collected,
+            conserve=qpol.get("conserve") or [],
+            prefer=qpol.get("prefer") or [],
+            strategy=str(qpol.get("strategy") or "auto"),
+        )
+        rec = quota_router.recommend_roster(
+            ranked,
+            conserve=qpol.get("conserve") or [],
+            prefer=qpol.get("prefer") or [],
+            strategy=str(qpol.get("strategy") or "auto"),
+        )
+        cand = rec.get(args.role_name) or (ranked[0]["harness"] if ranked else "")
+        if cand in HARNESSES:
+            to_harness = cand
+            routing_source = f"quota_router:{qpol.get('strategy', 'auto')}"
     if not to_harness:
         r_spec = (manifest.get("roster") or {}).get(args.role_name)
         if isinstance(r_spec, dict) and r_spec.get("harness"):
             to_harness = str(r_spec["harness"])
+            routing_source = f"roster:{args.role_name}"
     if to_harness not in HARNESSES:
         raise ValueError(f"Specify --to <{'|'.join(HARNESSES)}> or valid --track")
 
@@ -3463,6 +3669,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "job_id": job_id,
             "from": args.from_role,
             "to": to_harness,
+            "routing_source": routing_source,
             "role_name": args.role_name,
             "rework": is_rework,
             "round": next_round,
@@ -4790,6 +4997,23 @@ def _update_job_terminal_state(
         render_dialogue(repo, run_dir)
 
 
+def _trim_brief_message(msg: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Shorten assistant reply payload for `--brief` orchestrator token conservation."""
+    if not msg or not isinstance(msg, dict):
+        return msg
+    txt = str(msg.get("text") or "").strip()
+    if not txt:
+        return msg
+    lines = txt.splitlines()
+    short = "\n".join(lines[:5]).strip()
+    if len(short) > 300 or len(lines) > 5:
+        short = short[:297].rstrip() + "... [完整输出见 .agent-loop/LATEST.md]"
+    out = dict(msg)
+    out["text"] = short
+    out["truncated"] = len(short) != len(txt)
+    return out
+
+
 def _emit_watch_result(
     *,
     reason: str,
@@ -4805,12 +5029,13 @@ def _emit_watch_result(
     last_msg: dict[str, Any] | None = None,
     diagnostic: dict[str, Any] | None = None,
     as_json: bool = False,
+    brief: bool = False,
     workdir: Path | None = None,
     job_id: str = "",
 ) -> int:
     """Format and print standardized watch exit payload."""
     refreshed = load_manifest(run_dir) if run_dir else manifest
-    cmds = format_all_harness_commands(refreshed) if refreshed else {}
+    cmds = {} if brief else (format_all_harness_commands(refreshed) if refreshed else {})
     dialogue_md = str(run_dir / DIALOGUE_FILE) if run_dir else ""
     payload: dict[str, Any] = {
         "ok": reason == "COMPLETED",
@@ -4825,11 +5050,14 @@ def _emit_watch_result(
         "synced_to_ledger": synced,
         "git_head": git_head_short(workdir or repo),
         "git_status_short": git_status_short(workdir or repo),
-        "commits_since_base": commits_since_base,
-        "last_assistant_message": last_msg,
+        "commits_since_base": commits_since_base[:5] if brief else commits_since_base,
+        "last_assistant_message": _trim_brief_message(last_msg) if brief else last_msg,
         "dialogue_md": dialogue_md,
-        "commands": cmds,
     }
+    if brief:
+        payload["brief"] = True
+    else:
+        payload["commands"] = cmds
     if diagnostic:
         payload["diagnostic"] = diagnostic
     if as_json:
@@ -5277,6 +5505,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     settle_sec = max(float(args.settle_seconds), 0.0)
     overall_deadline = time.monotonic() + max(int(args.timeout), 1)
     base = manifest.get("base_commit") or "" if manifest else ""
+    brief_arg = getattr(args, "brief", None)
+    use_brief = (
+        bool(brief_arg)
+        if brief_arg is not None
+        else bool((manifest or {}).get("quota_policy", {}).get("brief", False))
+    )
 
     def _repo_commits(target_dir: Path) -> list[str]:
         if base and base != "NO_GIT":
@@ -5389,6 +5623,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 }
 
         ordered = [results_by_id[tr.job_id] for tr in trackers]
+        if use_brief:
+            for r in ordered:
+                r["last_assistant_message"] = _trim_brief_message(r.get("last_assistant_message"))
+                if len(r.get("commits_since_base") or []) > 5:
+                    r["commits_since_base"] = r["commits_since_base"][:5]
         completed_cnt = sum(1 for r in ordered if r["reason"] == "COMPLETED")
         stalled_cnt = sum(1 for r in ordered if r["reason"] == "STALLED")
         timeout_cnt = sum(1 for r in ordered if r["reason"] == "TIMEOUT")
@@ -5537,6 +5776,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 last_msg=res["last_msg"],
                 diagnostic=res["diagnostic"],
                 as_json=bool(args.json),
+                brief=use_brief,
                 workdir=workdir,
                 job_id=tracker.job_id,
             )
@@ -5561,10 +5801,146 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     "last_event_ts": tracker.last_event_ts,
                 },
                 as_json=bool(args.json),
+                brief=use_brief,
                 workdir=workdir,
                 job_id=tracker.job_id,
             )
         time.sleep(poll_interval)
+
+
+def cmd_quota(args: argparse.Namespace) -> int:
+    """Inspect CC Switch/open-source quotas, record subscription snapshots, or apply routing policy."""
+    action = (getattr(args, "action", None) or "show").strip().lower()
+    if action == "set":
+        if not getattr(args, "harness", ""):
+            print(json.dumps({"ok": False, "error": "quota set requires --harness <agy|claude|codex>"}, ensure_ascii=False), file=sys.stderr)
+            return 2
+        target = (
+            Path(args.snapshot).expanduser().resolve()
+            if getattr(args, "snapshot", "")
+            else (
+                quota_router.default_global_snapshot_path()
+                if getattr(args, "use_global", False)
+                else Path(args.repo).resolve() / quota_router.SNAPSHOT_REPO_REL
+            )
+        )
+        updated = quota_router.update_quota_snapshot(
+            target,
+            args.harness,
+            remaining_pct=args.remaining,
+            used_pct=args.used,
+            resets_in=args.resets_in,
+            resets_at=args.resets_at,
+            expires_at=args.expires_at,
+            window_hours=args.window_hours,
+            plan=args.plan,
+            balance_usd=args.balance,
+            note=args.note,
+        )
+        out = {"ok": True, "action": "set", "snapshot_path": str(target), "entry": updated["harnesses"][args.harness]}
+        print(json.dumps(out, ensure_ascii=False, indent=2) if args.json else f"[quota set] {args.harness} -> {target}")
+        return 0
+
+    repo = Path(args.repo).resolve() if getattr(args, "repo", "") else None
+    run_dir, manifest = _try_load_run(repo, getattr(args, "run_id", None)) if repo else (None, {})
+    qpol = manifest.get("quota_policy") if isinstance(manifest.get("quota_policy"), dict) else {}
+
+    conserve = _parse_csv_harnesses(args.conserve) if getattr(args, "conserve", None) is not None else list(qpol.get("conserve") or [])
+    prefer = _parse_csv_harnesses(args.prefer) if getattr(args, "prefer", None) is not None else list(qpol.get("prefer") or [])
+    strategy = getattr(args, "strategy", None) or str(qpol.get("strategy") or "auto")
+    probe = getattr(args, "probe", None) or str(qpol.get("probe") or "auto")
+    snap_p = Path(args.snapshot).expanduser().resolve() if getattr(args, "snapshot", "") else None
+
+    collected = quota_router.collect_quota_state(
+        repo=repo,
+        probe=probe,
+        probe_cmd=getattr(args, "probe_cmd", "") or "",
+        snapshot_path=snap_p,
+        binaries_available=_binary_availability(),
+    )
+    ranked = quota_router.score_harnesses(collected, conserve=conserve, prefer=prefer, strategy=strategy)
+    rec = quota_router.recommend_roster(ranked, conserve=conserve, prefer=prefer, strategy=strategy)
+
+    applied = False
+    if getattr(args, "apply", False):
+        if repo is None:
+            raise ValueError("--apply requires --repo")
+        run_dir = resolve_run_dir(repo, getattr(args, "run_id", None))
+        with _manifest_lock(run_dir):
+            manifest = load_manifest(run_dir)
+            qpol_m = manifest.setdefault("quota_policy", {})
+            qpol_m["conserve"] = conserve
+            qpol_m["prefer"] = prefer
+            qpol_m["strategy"] = strategy
+            qpol_m["probe"] = probe
+            brief_flag = getattr(args, "brief", None)
+            if brief_flag is not None:
+                qpol_m["brief"] = bool(brief_flag)
+            elif rec.get("brief_recommended"):
+                qpol_m["brief"] = True
+
+            roster = manifest.setdefault("roster", {})
+            for role_key in ("executor", "advisor", "verifier"):
+                new_h = rec.get(role_key)
+                if new_h:
+                    prev = roster.get(role_key) if isinstance(roster.get(role_key), dict) else {}
+                    keep_m = str(prev.get("model") or "") if prev.get("harness") == new_h else ""
+                    roster[role_key] = {"harness": new_h, "model": keep_m}
+            tracks = roster.setdefault("tracks", {})
+            for t_name, t_h in (rec.get("tracks") or {}).items():
+                if t_h in HARNESSES:
+                    prev_t = tracks.get(t_name) if isinstance(tracks.get(t_name), dict) else {}
+                    keep_m = str(prev_t.get("model") or "") if prev_t.get("harness") == t_h else ""
+                    tracks[t_name] = {"harness": t_h, "model": keep_m}
+            save_manifest(run_dir, manifest)
+
+        append_event(
+            repo,
+            run_dir,
+            role="user",
+            event="roster_set",
+            summary=f"按额度路由更新分工 ({strategy}): executor={rec['executor']}, advisor={rec['advisor']}, conserve={','.join(conserve) or '-'}",
+            body=json.dumps({"quota_policy": manifest["quota_policy"], "recommendation": rec}, ensure_ascii=False, indent=2),
+        )
+        applied = True
+
+    use_brief_out = bool(getattr(args, "brief", False))
+    if args.json:
+        if use_brief_out:
+            payload = {
+                "ok": True,
+                "brief": True,
+                "applied": applied,
+                "probe_used": collected.get("probe_used"),
+                "recommendation": rec,
+                "ranked": [
+                    {
+                        "harness": r["harness"],
+                        "eligible": r["eligible"],
+                        "remaining_pct": r.get("remaining_pct"),
+                        "spend_priority": r.get("spend_priority"),
+                        "hours_to_reset": r.get("hours_to_reset"),
+                        "hours_to_expiry": r.get("hours_to_expiry"),
+                        "score": r["score"],
+                        "protected_reason": r.get("protected_reason"),
+                    }
+                    for r in ranked
+                ],
+            }
+        else:
+            payload = {
+                "ok": True,
+                "applied": applied,
+                "collected": collected,
+                "ranked": ranked,
+                "recommendation": rec,
+            }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(quota_router.format_quota_table(collected, ranked, rec))
+        if applied and run_dir:
+            print(f"\n[已写入台账] {run_dir / DIALOGUE_FILE}")
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -5581,6 +5957,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "round": manifest.get("round"),
         "max_rounds": manifest.get("max_rounds", DEFAULT_MAX_ROUNDS),
         "terminal_reason": manifest.get("terminal_reason", ""),
+        "quota_policy": manifest.get("quota_policy", {}),
         "base_commit": manifest.get("base_commit"),
         "current_head": git_head_short(repo),
         "tmux_session": default_tmux_session_name(manifest, repo),
@@ -5704,11 +6081,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "matches_canonical": bool(exists and real == canonical_real),
         }
 
+    cc_switch_db = Path.home() / ".cc-switch" / "cc-switch.db"
+    probes = {
+        "quota-axi": {"installed": bool(shutil.which("quota-axi")), "path": shutil.which("quota-axi") or ""},
+        "codexbar": {"installed": bool(shutil.which("codexbar")), "path": shutil.which("codexbar") or ""},
+        "cclimits": {"installed": bool(shutil.which("cclimits")), "path": shutil.which("cclimits") or ""},
+        "cc_switch_db": {"exists": cc_switch_db.exists(), "path": str(cc_switch_db)},
+    }
+
     report = {
         "ok": True,
         "python_version": sys.version.split()[0],
         "skill_root": str(skill_root),
         "binaries": binaries,
+        "probes": probes,
         "skill_mounts": skill_mounts,
         "agy_brain_roots": {
             "desktop": {"path": str(AGY_BRAIN_ROOT), "exists": AGY_BRAIN_ROOT.exists()},
@@ -5730,6 +6116,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"  OK  {name}: {info['path']}{ver}")
         else:
             print(f"  --  {name}: not found")
+    print("\n[Quota Probes]")
+    for pname, pinfo in probes.items():
+        if pname == "cc_switch_db":
+            print(f"  {'OK' if pinfo['exists'] else '--':4s} cc_switch_db: {pinfo['path']}")
+        else:
+            print(f"  {'OK' if pinfo['installed'] else '--':4s} {pname}: {pinfo['path'] or 'not installed (npx fallback via --probe)'}")
     print("\n[Skill Mounts]")
     for label, info in skill_mounts.items():
         mark = "OK" if info["matches_canonical"] else ("WARN" if info["exists"] else "--")
@@ -5757,6 +6149,11 @@ def build_parser() -> argparse.ArgumentParser:
         tgroup.add_argument("--no-tmux", dest="tmux", action="store_false")
         p.add_argument("--tmux-session", default="")
 
+    def _add_brief_args(p: argparse.ArgumentParser) -> None:
+        bgroup = p.add_mutually_exclusive_group()
+        bgroup.add_argument("--brief", dest="brief", action="store_true", default=None)
+        bgroup.add_argument("--no-brief", dest="brief", action="store_false")
+
     p_init = sub.add_parser("init", help="Initialize a new traceable loop run")
     p_init.add_argument("--repo", default=".")
     p_init.add_argument("--slug", required=True)
@@ -5773,6 +6170,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--track", action="append", default=None, help="Bind named track (<name>=<harness>[:<model>])")
     p_init.add_argument("--tmux-session", default="")
     p_init.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS)
+    p_init.add_argument("--conserve", default="", help="Comma-separated harnesses to conserve (e.g. agy)")
+    p_init.add_argument("--prefer", default="", help="Comma-separated harnesses to burn first (e.g. codex,claude)")
+    p_init.add_argument("--quota-strategy", choices=quota_router.STRATEGY_CHOICES, default="auto")
+    p_init.add_argument("--probe", choices=quota_router.PROBE_CHOICES, default="auto")
+    p_init.add_argument("--probe-cmd", default="")
+    p_init.add_argument("--snapshot", default="")
+    p_init.add_argument("--auto-roster", action="store_true", help="Resolve initial roster/tracks from quota telemetry")
+    _add_brief_args(p_init)
     p_init.add_argument("--json", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
@@ -5785,6 +6190,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_roster.add_argument("--verifier", default="")
     p_roster.add_argument("--advisor", default="")
     p_roster.add_argument("--track", action="append", default=None, help="Update named track (<name>=<harness>[:<model>])")
+    p_roster.add_argument("--conserve", default="")
+    p_roster.add_argument("--prefer", default="")
+    p_roster.add_argument("--quota-strategy", choices=quota_router.STRATEGY_CHOICES, default="")
+    p_roster.add_argument("--probe", choices=quota_router.PROBE_CHOICES, default="")
+    p_roster.add_argument("--probe-cmd", default="")
+    p_roster.add_argument("--snapshot", default="")
+    p_roster.add_argument("--auto-roster", action="store_true")
+    _add_brief_args(p_roster)
     p_roster.add_argument("--json", action="store_true")
     p_roster.set_defaults(func=cmd_set_roster)
 
@@ -5896,6 +6309,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.add_argument("--sandbox", choices=("workspace-write", "danger-full-access"), default="workspace-write")
     p_del.add_argument("--timeout", type=int, default=600)
     p_del.add_argument("--rework", action="store_true")
+    p_del.add_argument("--auto-route", action="store_true")
     p_del.add_argument("--force", action="store_true")
     p_del.add_argument("--allow-nested", action="store_true")
     p_del.add_argument("--dry-run", action="store_true")
@@ -5978,8 +6392,35 @@ def build_parser() -> argparse.ArgumentParser:
     sync_grp = p_watch.add_mutually_exclusive_group()
     sync_grp.add_argument("--sync-ledger", dest="sync_ledger", action="store_true", default=True)
     sync_grp.add_argument("--no-sync-ledger", dest="sync_ledger", action="store_false")
+    _add_brief_args(p_watch)
     p_watch.add_argument("--json", action="store_true")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_quota = sub.add_parser("quota", help="Probe CC Switch/open-source quotas, snapshot limits, or apply routing")
+    p_quota.add_argument("action", nargs="?", choices=("show", "set"), default="show")
+    p_quota.add_argument("--repo", default=".")
+    p_quota.add_argument("--run-id", default=None)
+    p_quota.add_argument("--probe", choices=quota_router.PROBE_CHOICES, default=None)
+    p_quota.add_argument("--probe-cmd", default="")
+    p_quota.add_argument("--snapshot", default="")
+    p_quota.add_argument("--conserve", default=None)
+    p_quota.add_argument("--prefer", default=None)
+    p_quota.add_argument("--strategy", choices=quota_router.STRATEGY_CHOICES, default=None)
+    p_quota.add_argument("--apply", action="store_true")
+    _add_brief_args(p_quota)
+    p_quota.add_argument("--harness", choices=HARNESSES, default="")
+    p_quota.add_argument("--remaining", type=float, default=None)
+    p_quota.add_argument("--used", type=float, default=None)
+    p_quota.add_argument("--resets-in", default=None)
+    p_quota.add_argument("--resets-at", default=None)
+    p_quota.add_argument("--expires-at", default=None)
+    p_quota.add_argument("--window-hours", type=float, default=None)
+    p_quota.add_argument("--plan", default=None)
+    p_quota.add_argument("--balance", type=float, default=None)
+    p_quota.add_argument("--note", default=None)
+    p_quota.add_argument("--global", dest="use_global", action="store_true")
+    p_quota.add_argument("--json", action="store_true")
+    p_quota.set_defaults(func=cmd_quota)
 
     p_tmux = sub.add_parser("tmux", help="Inspect, attach, tail, or stop tmux dashboard and worker windows")
     tmux_sub = p_tmux.add_subparsers(dest="tmux_cmd", required=True)

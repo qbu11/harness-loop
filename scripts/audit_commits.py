@@ -500,8 +500,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--screenshots-dir", default="e2e/screenshots")
     parser.add_argument("--allow-known-report", action="append", default=None)
     parser.add_argument("--skip-worktree-check", action="store_true")
+    parser.add_argument("--brief", action="store_true")
     parser.add_argument("--json", action="store_true")
     return parser
+
+
+def _compact_brief_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Produce a token-saving compact summary of an audit report."""
+    checks = report.get("checks") or []
+    cui_chk = next((c for c in checks if c.get("name") == "cui_first_discipline"), {})
+    rep_chk = next((c for c in checks if c.get("name") == "reports_zero_failed_and_fresh"), {})
+    if report.get("ok"):
+        return {
+            "ok": True,
+            "brief": True,
+            "repo": report["repo"],
+            "range": report["range"],
+            "stage": report["stage"],
+            "passed": report["passed"],
+            "failed": report["failed"],
+            "milestone_orders": cui_chk.get("milestone_orders", {}),
+            "reports": [
+                {"report": r.get("report"), "passed": r.get("passed"), "failed": r.get("failed"), "fresh": r.get("fresh")}
+                for r in (rep_chk.get("checked") or [])
+                if r.get("fresh") or not r.get("older_milestone")
+            ],
+        }
+    return {
+        "ok": False,
+        "brief": True,
+        "repo": report["repo"],
+        "range": report["range"],
+        "stage": report["stage"],
+        "passed": report["passed"],
+        "failed": report["failed"],
+        "failed_checks": [c for c in checks if not c.get("passed")],
+    }
 
 
 def main() -> int:
@@ -514,7 +548,8 @@ def main() -> int:
         return 2
 
     if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        out_payload = _compact_brief_report(report) if args.brief else report
+        print(json.dumps(out_payload, ensure_ascii=False, indent=2))
     else:
         print(f"Audit {report['range']}: {report['passed']} passed, {report['failed']} failed")
         for c in report["checks"]:

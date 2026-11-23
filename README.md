@@ -40,6 +40,24 @@ curl -fsSL https://raw.githubusercontent.com/qbu11/harness-loop/main/install.sh 
    - 独立检查每里程碑（`M1`, `M2`...）后端先于前端纪律、工作区洁净、无 AI 署名、无残留失败截图与测试报告新鲜度。
 6. **清晰闭环终止与返工上限硬门禁（`DONE / ESCALATED / ABORTED`）**
    - `delegate --rework` 默认上限 `2` 轮，超限自动拦截并置 `ESCALATED`；`record --event signoff` 硬校验 `PASS` + 无活跃/失败任务 + `ux_walkthrough` 后才落为 `DONE`，也支持 `escalate` / `abort` 显式停机。
+7. **额度感知选端（`feat/quota-aware-routing` 分支特性）**
+   - 复用开源探针 `quota-axi` / `codexbar` / `cclimits`（只读叠加 CC Switch 本地 `cc-switch.db` 健康度、花销与 `codexQuotaProtection` 阈值，及 Codex 原生 `rate_limits`），通过 `--conserve` / `--prefer` / `--strategy expiring_first|abundant_first` 决定先烧谁、省谁，并在省主机模式开启 `--brief` 与异构交叉审校。详见 [references/quota-routing.md](references/quota-routing.md)。
+
+---
+
+## 本分支专用安装与额度路由速查
+
+```bash
+# 直接安装本分支
+curl -fsSL https://raw.githubusercontent.com/qbu11/harness-loop/feat/quota-aware-routing/install.sh | bash
+
+# 查看各端剩余额度、CC Switch 状态与推荐分工（例如省 AGY，优先烧临期/富裕额度）
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py quota --conserve agy --strategy expiring_first
+
+# 初始化闭环并自动按额度选端 + 开启精简回包
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py init \
+  --repo . --slug my-feature --conserve agy --prefer codex --quota-strategy expiring_first --auto-roster --json
+```
 
 ---
 

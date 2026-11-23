@@ -64,7 +64,8 @@ python3 -B ~/.agents/skills/harness-loop/scripts/audit_commits.py \
 ```
 
 ### 维度 B：逐文件 Diff 深审（高频隐患清单）
-执行 `git diff <base_commit>..HEAD` 并重点核查：
+- 若开启了 `--conserve agy`，先派非编写端通过 `consult` 对整批改动做第一轮全量 Diff 对抗审查并返回 `文件:行号 + 风险` 短清单，AGY 只重点复核高风险片段与跨模块边界。
+- 否则由验证者执行 `git diff <base_commit>..HEAD` 并重点核查：
 1. **鉴权与路径安全**：ID 校验与路径规范化落沙盒内，非授权用户真返回 `403`。
 2. **原子写与并发**：临时文件写盘 + `os.replace`/原子重命名；目录快照含 `until_commit` 时不含未来分支或未提交文件。
 3. **缓存与数据一致性**：列表/摘要/预览是否误复用陈旧快照，主逻辑与批处理分支是否漏记状态或双记。
@@ -76,7 +77,7 @@ python3 -B ~/.agents/skills/harness-loop/scripts/audit_commits.py \
 - 亲自复跑 `tsc`、单元测试、`cargo test` 与守卫脚本，确认实测数字与提交信息一致，不产生脏工作区。
 
 ### 维度 D：逐张读图目视核验
-使用 `read_file` 打开本轮新增或更新的所有截图（`.png`），逐张核对：
+使用 `read_file` 打开本轮新增或更新的所有截图（`.png`，开启 `--conserve agy` 时以自动化视觉脚本全量兜底、`read_file` 抽核 3–5 张核心/异常截图），逐张核对：
 - 折叠按钮/顶栏文字是否重叠或折行；
 - 深/浅双主题与大字版下的文字对比度、卡片对齐、零毛玻璃（`backdrop-filter: none`）；
 - 不同视口下宽屏分栏与窄屏降级是否无横向溢出、破图或乱码。

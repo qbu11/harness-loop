@@ -5,6 +5,7 @@ set -euo pipefail
 # Supports both remote `curl -fsSL ... | bash` and local `bash ./install.sh`.
 
 REPO_URL="${HARNESS_LOOP_REPO_URL:-${AGY_LOOP_REPO_URL:-https://github.com/qbu11/harness-loop.git}}"
+BRANCH="${HARNESS_LOOP_BRANCH:-feat/quota-aware-routing}"
 SKILL_NAME="harness-loop"
 AGENTS_SKILLS_DIR="$HOME/.agents/skills"
 CANONICAL_DIR="$AGENTS_SKILLS_DIR/$SKILL_NAME"
@@ -12,13 +13,14 @@ INIT_AGENTS_DIR=""
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--init-agents <repo_dir>] [--help]
+Usage: install.sh [--branch <name>] [--init-agents <repo_dir>] [--help]
 
 Installs harness-loop into ~/.agents/skills/harness-loop and mounts symlinks
 for Claude Code (~/.claude/skills), Codex (~/.codex/skills), and Antigravity
 (~/.gemini/config/skills), then runs `loopctl.py doctor`.
 
 Options:
+  --branch <name>           Git branch to install when cloning (default: feat/quota-aware-routing)
   --init-agents <repo_dir>  Also append the 3-line role template to <repo_dir>/AGENTS.md
   -h, --help                Show this help message
 EOF
@@ -26,6 +28,14 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --branch)
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --branch requires a branch name argument" >&2
+        exit 1
+      fi
+      BRANCH="$2"
+      shift 2
+      ;;
     --init-agents)
       if [ $# -lt 2 ]; then
         echo "ERROR: --init-agents requires a repository path argument" >&2
@@ -73,9 +83,11 @@ if [ -z "$SRC_ROOT" ]; then
     exit 1
   fi
   if [ -d "$CANONICAL_DIR/.git" ]; then
-    echo "Updating existing git checkout at $CANONICAL_DIR..."
+    echo "Updating existing git checkout at $CANONICAL_DIR (branch: $BRANCH)..."
     if [ -z "$(git -C "$CANONICAL_DIR" status --porcelain)" ]; then
-      git -C "$CANONICAL_DIR" pull --ff-only
+      git -C "$CANONICAL_DIR" fetch origin "$BRANCH"
+      git -C "$CANONICAL_DIR" checkout "$BRANCH"
+      git -C "$CANONICAL_DIR" pull --ff-only origin "$BRANCH"
     else
       echo "WARN: $CANONICAL_DIR has local changes; skipping git pull."
     fi
@@ -85,8 +97,8 @@ if [ -z "$SRC_ROOT" ]; then
       echo "Backing up existing $CANONICAL_DIR -> $BACKUP"
       mv "$CANONICAL_DIR" "$BACKUP"
     fi
-    echo "Cloning $REPO_URL -> $CANONICAL_DIR..."
-    git clone "$REPO_URL" "$CANONICAL_DIR"
+    echo "Cloning $REPO_URL (branch: $BRANCH) -> $CANONICAL_DIR..."
+    git clone -b "$BRANCH" "$REPO_URL" "$CANONICAL_DIR"
   fi
 else
   REAL_SRC="$(realpath_py "$SRC_ROOT")"
@@ -109,6 +121,7 @@ fi
 chmod +x \
   "$CANONICAL_DIR/install.sh" \
   "$CANONICAL_DIR/scripts/loopctl.py" \
+  "$CANONICAL_DIR/scripts/quota_router.py" \
   "$CANONICAL_DIR/scripts/audit_commits.py" \
   "$CANONICAL_DIR/scripts/test_loopctl.py" 2>/dev/null || true
 

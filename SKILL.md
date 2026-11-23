@@ -9,9 +9,10 @@ metadata:
 
 本 Skill 用于协调多个 AI 编程 Harness 协同开发——内置 **Antigravity（`agy`）**、**Claude Code（`claude`）** 与 **Codex（`codex`，含 `gpt-6.2-sol`）**，角色花名册、共享台账 `.agent-loop/` 与 `tmux` 编排均与具体 Harness 解耦，可平顺扩展更多 CLI/ACP Harness。
 
-> **两条核心保障**：
+> **两条核心保障（外加本分支额度路由）**：
 > 1. **全程 Tmux 可视化**：派发与咨询会话默认自动运行在 `hl-<slug>` `tmux` 会话中（Window 0 为总览看板，每个工作流占独立命名窗），随时 `tmux attach` 或 `loopctl.py tmux tail` 查进度；
-> 2. **全链路可追溯台账**：每次闭环都在目标仓库生成 Git 自动忽略的 `<repo>/.agent-loop/LATEST.md`，留存角色/赛道分配、提示词、交付实测、终审裁决与全端原生恢复命令。
+> 2. **全链路可追溯台账**：每次闭环都在目标仓库生成 Git 自动忽略的 `<repo>/.agent-loop/LATEST.md`，留存角色/赛道分配、提示词、交付实测、终审裁决与全端原生恢复命令；
+> 3. **按额度选端与省主机 Token**：可用 `loopctl.py quota`（复用 `quota-axi` / `codexbar` / `cclimits` + 只读 CC Switch 本地保护线）配合 `--conserve <h>` 与 `--prefer <h>`，优先烧快到期/最富裕额度并在需要时开启 `--brief` + 异构交叉审校，详见 [references/quota-routing.md](references/quota-routing.md)。
 
 ---
 
@@ -50,18 +51,19 @@ metadata:
 
 | 命令 | 用途 | 核心参数 |
 |---|---|---|
-| `loopctl.py init` | 初始化闭环、花名册与赛道 | `--repo <dir> --slug <slug> [--architect/--executor/--verifier] [--track k=h[:m]] [--max-rounds 2] [--tmux-session s] --json` |
-| `loopctl.py set-roster` | 运行中动态改角色/赛道/模型 | `--repo <dir> [--executor ...] [--track k=h[:m]] --json` |
+| `loopctl.py init` | 初始化闭环、花名册与赛道 | `--repo <dir> --slug <slug> [--conserve agy] [--prefer codex] [--quota-strategy expiring_first\|abundant_first\|auto\|manual] [--auto-roster] [--brief] [--max-rounds 2] --json` |
+| `loopctl.py quota` | **探测各端额度、快照与选端推荐** | `[show \| set] [--repo <dir>] [--probe auto\|quota-axi\|codexbar\|cclimits\|local] [--conserve csv] [--prefer csv] [--strategy mode] [--apply] [--brief] --json` |
+| `loopctl.py set-roster` | 运行中动态改角色/赛道/模型/策略 | `--repo <dir> [--executor ...] [--track k=h[:m]] [--conserve csv] [--prefer csv] [--auto-roster] --json` |
 | `loopctl.py delegate` | **派发写任务（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] [--wave w] [--track t] [--label lbl] [--to h] [--model m] [--rework] [--force] [--tmux\|--no-tmux] --json` |
 | `loopctl.py consult` | **只读跨端评审（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] --from <h> --to <h> (--prompt\|--prompt-file) [--no-tmux] --json` |
-| `loopctl.py watch` | **零 Token 守候单任务/整波** | `--repo <dir> (--job-id id \| --wave w \| --jobs id1,id2 \| --all-active \| --harness h) [--stall-timeout 600] --json` |
+| `loopctl.py watch` | **零 Token 守候单任务/整波** | `--repo <dir> (--job-id id \| --wave w \| --jobs id1,id2 \| --all-active \| --harness h) [--stall-timeout 600] [--brief] --json` |
 | `loopctl.py tmux` | 看板、接入、抓屏、停止 | `status \| dashboard \| attach [--job-id id] \| tail [--job-id id] [--lines 40] \| stop (--job-id id\|--all)` |
 | `loopctl.py view` | **纯只读回放任意端会话全文** | `[--repo dir] [--target all\|dialogue\|claude\|codex\|agy] [--claude-id id] [--codex-id id] [--agy-id id] [--job-id id] [--last 10] [--full]` |
 | `loopctl.py inspect` | 结构化只读切片 + 同步交卷 | `--harness <agy\|claude\|codex> --repo <dir> [--workdir <wt>] [--job-id id] [--sync-ledger] --json` |
 | `loopctl.py record` | 写入事件、终审与停机终态 | `--repo <dir> --role <r> --event <type> --summary <txt> [--verdict PASS\|NEEDS_FIX] [--skip-ux] [--force] [--commits csv]` |
 | `loopctl.py snippet` | 追加项目 `AGENTS.md` 三行分工 | `[--append <repo>] [--json]` |
 | `loopctl.py doctor` | 自检各 CLI、`tmux` 与软链 | `[--json]` |
-| `audit_commits.py` | 7 项工程纪律与多里程碑审计 | `--repo <dir> --base <sha> [--stage full\|cui] [--skip-worktree-check] --json` |
+| `audit_commits.py` | 7 项工程纪律与多里程碑审计 | `--repo <dir> --base <sha> [--stage full\|cui] [--skip-worktree-check] [--brief] --json` |
 
 ---
 
