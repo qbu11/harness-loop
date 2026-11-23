@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Post-Verifier repository and gate auditor for agy-claude-loop.
+"""Deterministic Post-Verifier repository and gate auditor for harness-loop.
 
 Read-only script that inspects git commit range <base>..<head>, verifies
 worktree cleanliness, CUI-First commit ordering, absence of AI attribution,

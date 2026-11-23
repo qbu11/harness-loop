@@ -5,7 +5,7 @@
 ### A. 本地零 Token 状态监测 `watch`（优先，零轮询、零全局 Hook 污染）
 - 后台派活（Codex / Claude Code）后，直接将 `loopctl.py watch` 作为 AGY 后台命令挂起；它在本地以纯 Python 每 2 秒低开销检查四合一信号，**等待期间消耗 0 LLM Token**，目标结束瞬间退出并借 AGY 原生后台任务通知唤醒**当前这个对应的 AGY 对话**（通过 `last_dispatch_epoch` 与 `--since-epoch` 避开历史回合误判，并用 `ps -o stat=` 过滤 UNIX `Z` 僵尸进程以免父进程未回收时误判存活）：
   ```bash
-  python3 -B ~/.agents/skills/agy-claude-loop/scripts/loopctl.py watch \
+  python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py watch \
     --repo "<repo>" --harness <codex|claude> --stall-timeout 600 --timeout 7200 --json
   ```
 - **返回状态与退出码语义**：
@@ -26,7 +26,7 @@
 
 1. **优先读取无侵入可观测源**：
    ```bash
-   python3 ~/.agents/skills/agy-claude-loop/scripts/loopctl.py inspect-cc --repo "<repo>" --tail-turns 4 --json
+   python3 ~/.agents/skills/harness-loop/scripts/loopctl.py inspect-cc --repo "<repo>" --tail-turns 4 --json
    ```
    - `inspect-cc` 结合 `claude agents --all --json` 与会话 `.jsonl` 末尾切片判定 `normalized_state`：
      - `RUNNING`：仍在跑测试或写代码，**不要打断它**。立刻调用 AGY 的 `schedule` 工具设下一跳定时器（如短活 `DurationSeconds=900`~`1800`，长活 `3600`），Prompt 中写清 repo、base_commit、session_id 与本步骤指令。
@@ -42,7 +42,7 @@
 
 ### 维度 A：确定性工程与提交链核查
 ```bash
-python3 ~/.agents/skills/agy-claude-loop/scripts/audit_commits.py \
+python3 ~/.agents/skills/harness-loop/scripts/audit_commits.py \
   --repo "<repo>" --base "<base_commit>" --head HEAD --json
 ```
 核查：

@@ -1,13 +1,13 @@
 ---
-name: agy-claude-loop
-description: Orchestrates the closed-loop Architect-Executor-PostVerifier workflow across Antigravity (agy), Claude Code, and Codex (including GPT-6.2-Sol / gpt-6.2-sol) with full bidirectional session traceability. Activate in any of the three harnesses when running dynamic role assignments, authoring or executing a PRD/Tech-Spec/Test-Plan/Handoff doc pack, consulting another harness mid-flight for review or improvement ideas, delegating implementation or rework across harnesses, monitoring sessions, running post-verifier audits, or doing live UX walkthroughs.
+name: harness-loop
+description: Orchestrates the closed-loop Architect-Executor-PostVerifier workflow across multiple AI coding harnesses — built-in adapters for Antigravity (agy), Claude Code (claude), and Codex (codex, including GPT-6.2-Sol / gpt-6.2-sol), extensible to future CLI/ACP harnesses — with full bidirectional session traceability. Activate in any harness when running dynamic role assignments, authoring or executing a PRD/Tech-Spec/Test-Plan/Handoff doc pack, consulting another harness mid-flight for review or improvement ideas, delegating implementation or rework across harnesses, monitoring sessions with zero-token watch, running post-verifier audits, or doing live UX walkthroughs.
 metadata:
-  short-description: Traceable multi-harness loop across AGY, Claude Code, and Codex
+  short-description: Traceable multi-harness collaboration loop (AGY, Claude Code, Codex & more)
 ---
 
-# 三端动态闭环协作与可追溯工作流（Antigravity ↔ Claude Code ↔ Codex）
+# 多 Harness 动态闭环协作与可追溯工作流（harness-loop）
 
-本 Skill 供 **Antigravity（`agy`）**、**Claude Code（`claude`）** 与 **Codex（`codex`，含 `GPT-6.2-Sol` / `gpt-6.2-sol`）** 三端共同调用，支持**按用户指定的角色花名册动态分工**，并让任意一个 Harness 在**任意中间环节**都能向其他端只读取经（`consult`）、指挥修改与执行（`delegate`）、或查阅实时进度（`inspect`）。
+本 Skill 面向多 AI 编程 Harness 协同工作，当前内置 **Antigravity（`agy`）**、**Claude Code（`claude`）** 与 **Codex（`codex`，含 `GPT-6.2-Sol` / `gpt-6.2-sol`）** 适配器，角色花名册、共享台账 `.agent-loop/` 与互调协议均与具体 Harness 解耦，便于后续无缝接入更多 CLI / ACP Harness。支持**按用户指定的角色花名册动态分工**，并让任意一个 Harness 在**任意中间环节**都能向其他端只读取经（`consult`）、指挥修改与执行（`delegate`）、或查阅实时进度（`inspect`）。
 
 > **全链路透明可见保障**：每次闭环都在目标仓库生成 Git 自动忽略的共享对话台账 `<repo>/.agent-loop/LATEST.md`（实际存放在 `<repo>/.agent-loop/<run-id>/DIALOGUE.md`），汇总三端角色分工、全部互调提示词、执行交卷与终审裁决，并保留三端原生接管命令（`conversation://`、`claude attach` / `--resume`、`codex resume`）。
 
@@ -45,7 +45,7 @@ metadata:
 
 ## 2. 工具脚本速查（零外部依赖 Python 3）
 
-脚本所在目录：`"$HOME/.agents/skills/agy-claude-loop/scripts"`；跨端互调详细命令与模型别名对照见 [references/cross-harness-mesh.md](references/cross-harness-mesh.md)。
+脚本所在目录：`"$HOME/.agents/skills/harness-loop/scripts"`；跨端互调详细命令与模型别名对照见 [references/cross-harness-mesh.md](references/cross-harness-mesh.md)。
 
 | 脚本与子命令 | 用途 | 核心参数 |
 |---|---|---|
@@ -70,7 +70,7 @@ metadata:
 
 1. **只读咨询 vs 写入派发分离**：
    - 想在任何中间步骤问别的模型「这个设计/这段 diff 有没有隐患？怎么改更好？」→ 调 **`loopctl.py consult`**（强制使用 AGY `--mode plan`、Claude `--permission-mode plan`、Codex `-s read-only`），绝不改文件；
-   - 想让另一个 Harness 动手写代码、改 bug、跑重型验收 → 调 **`loopctl.py delegate`**（受同仓库单写者检查与 `AGY_LOOP_DEPTH < 2` 防递归护栏保护）。
+   - 想让另一个 Harness 动手写代码、改 bug、跑重型验收 → 调 **`loopctl.py delegate`**（受同仓库单写者检查与 `HARNESS_LOOP_DEPTH < 2` 防递归护栏保护，兼容旧变量 `AGY_LOOP_DEPTH`）。
 2. **模型继承与显式覆盖规则**：
    - 未显式指定模型时，**绝不传 `--model` / `-m`**，一律沿用目标 Harness 自己的全局默认配置，且**严禁跨 Harness 串用认证/Provider 环境变量**；
    - 用户明确指定某角色用特定模型（如 **`GPT-6.2-Sol`** / **`Codex GPT 6.2 Sol`** → `gpt-6.2-sol`）时，写入 `roster` 或通过 `--model` 传入；常见别名对照见 [references/cross-harness-mesh.md](references/cross-harness-mesh.md#2-本机模型别名与继承规则)。
@@ -99,7 +99,7 @@ metadata:
 2. **CUI-First 分阶段施工**：先全绿完成并提交全部纯后端/CLI 阶段（`P0*`），再修改前端源码；遇到架构/需求疑点或高风险改动时，可随时调 `loopctl.py consult --from <self> --to <architect|advisor>` 获取另一端的只读改进建议。
 3. **交卷自检与回写**：收口前运行 `audit_commits.py --repo . --base "<base_commit>" --json` 确认 `failed == 0` 且工作区干净，再执行：
    ```bash
-   python3 "$HOME/.agents/skills/agy-claude-loop/scripts/loopctl.py" record \
+   python3 "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" record \
      --repo . --role <claude|codex|agy> --event delivery \
      --summary "<一句话总结交付与门禁实测>" --commits "<hash1..hashN>" \
      --body "<阶段Commit对照 + 各层实测数字 + 与Spec细微差异>" --json
@@ -117,9 +117,9 @@ metadata:
 
 每次交接、跨端咨询、进度汇报或终审放行，回复用户时末尾必须附上实时可查入口：
 - **共享闭环台账**：`[LATEST.md](file://<repo>/.agent-loop/LATEST.md)`（汇总角色花名册、每一轮三端互调记录与 SHA-256 哈希）
-- **一行命令同时回看 Codex + AGY 对话**：`python3 -B ~/.agents/skills/agy-claude-loop/scripts/loopctl.py view --repo "<repo>"`
+- **一行命令同时回看 Codex + AGY 对话**：`python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py view --repo "<repo>"`
 - **Antigravity 会话**：
-  - Desktop 会话（`~/.gemini/antigravity/brain/<agy-id>/`）与 `agy` CLI 会话（`~/.gemini/antigravity-cli/brain/<agy-id>/`）分库存储；Desktop 会话在终端可用 `python3 -B ~/.agents/skills/agy-claude-loop/scripts/loopctl.py view --agy-id <agy-id> --last 10` 查看，IDE 内点击 `conversation://<agy-id>`；仅 CLI 会话额外支持 `agy --conversation <agy-id>`。
+  - Desktop 会话（`~/.gemini/antigravity/brain/<agy-id>/`）与 `agy` CLI 会话（`~/.gemini/antigravity-cli/brain/<agy-id>/`）分库存储；Desktop 会话在终端可用 `python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py view --agy-id <agy-id> --last 10` 查看，IDE 内点击 `conversation://<agy-id>`；仅 CLI 会话额外支持 `agy --conversation <agy-id>`。
 - **Claude Code 会话**：`claude attach <bg-id>` / `claude logs <bg-id>` / `claude --resume <cc-session-id>`
 - **Codex 会话**：`cd "<repo>" && codex resume <codex-session-id>`（日志：`~/.codex/sessions/**/rollout-*-<codex-session-id>.jsonl`）
 
@@ -127,10 +127,10 @@ metadata:
 
 ## 6. 新项目接入模板（`AGENTS.md` 各端一行角色声明）
 
-在新仓库开局时运行 `python3 -B ~/.agents/skills/agy-claude-loop/scripts/loopctl.py snippet --append <repo>`（或手动写入 `AGENTS.md`），让三端 Agent 打开仓库即可读懂各自默认职责：
+在新仓库开局时运行 `python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py snippet --append <repo>`（或手动写入 `AGENTS.md`），让三端 Agent 打开仓库即可读懂各自默认职责：
 
 ```markdown
-## 多 Harness 协作角色（默认口径，均调用 `agy-claude-loop`）
+## 多 Harness 协作角色（默认口径，均调用 `harness-loop`）
 
 - **Antigravity（`agy`）**：默认任 **Architect + Post-Verifier + 体验官**——负责项目审查、撰写 PRD/Tech-Spec/Test-Plan/Handoff 规格包，用 `loopctl.py delegate` 派活并挂 `loopctl.py watch` 零 Token 守候，完工后独立四维终审、实机体验并向用户结项。
 - **Claude Code（`claude`）**：默认任 **Executor**（复杂需求默认首行 `ultracode`）——严格按规格包 CUI-First 分阶段施工与提交，遇口径疑问可 `loopctl.py consult` 取经，收口前自跑 `audit_commits.py` 并回写 `.agent-loop/LATEST.md`。

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Zero-config installer for agy-claude-loop across Antigravity, Claude Code, and Codex.
+# Zero-config installer for harness-loop across Antigravity, Claude Code, Codex, and future harnesses.
 # Supports both remote `curl -fsSL ... | bash` and local `bash ./install.sh`.
 
-REPO_URL="${AGY_LOOP_REPO_URL:-https://github.com/qbu11/agy-claude-loop.git}"
-SKILL_NAME="agy-claude-loop"
+REPO_URL="${HARNESS_LOOP_REPO_URL:-${AGY_LOOP_REPO_URL:-https://github.com/qbu11/harness-loop.git}}"
+SKILL_NAME="harness-loop"
 AGENTS_SKILLS_DIR="$HOME/.agents/skills"
 CANONICAL_DIR="$AGENTS_SKILLS_DIR/$SKILL_NAME"
 INIT_AGENTS_DIR=""
@@ -14,7 +14,7 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [--init-agents <repo_dir>] [--help]
 
-Installs agy-claude-loop into ~/.agents/skills/agy-claude-loop and mounts symlinks
+Installs harness-loop into ~/.agents/skills/harness-loop and mounts symlinks
 for Claude Code (~/.claude/skills), Codex (~/.codex/skills), and Antigravity
 (~/.gemini/config/skills), then runs `loopctl.py doctor`.
 

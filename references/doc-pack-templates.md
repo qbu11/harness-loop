@@ -68,8 +68,8 @@ ultracode
 请先核对当前工作区状态（`rtk git status --short` 为空，基线 `<base_commit>`，切勿回退 <列出不可回退的近期提交或关键修复>）。
 
 确认后，先运行以下命令读取本次闭环台账与上游设计上下文：
-python3 ~/.agents/skills/agy-claude-loop/scripts/loopctl.py status --repo "<repo_path>" --json
-python3 ~/.agents/skills/agy-claude-loop/scripts/loopctl.py bind-session --repo "<repo_path>" --run-id "<run_id>" --harness "<claude|codex|agy>" --json
+python3 ~/.agents/skills/harness-loop/scripts/loopctl.py status --repo "<repo_path>" --json
+python3 ~/.agents/skills/harness-loop/scripts/loopctl.py bind-session --repo "<repo_path>" --run-id "<run_id>" --harness "<claude|codex|agy>" --json
 
 随后完整阅读以下文档并严格按 `docs/HANDOFF-<slug>.md` 分阶段执行：
 1. `docs/PRD-<slug>.md`
@@ -84,8 +84,8 @@ python3 ~/.agents/skills/agy-claude-loop/scripts/loopctl.py bind-session --repo 
 3. 完成前端阶段与全量端到端/视觉验收后，逐张检查新增截图无裁切、重叠、破图或乱码，并更新 `docs/DEVLOG.md`；
 4. 全过程禁用 `rm`（弃置文件移入 `~/.Trash/`），不触碰保护目录，提交用 `rtk git` 且不加 AI 署名、不 `git push`；
 5. 收口前运行自检并将结构化交卷单写入共享台账：
-   python3 ~/.agents/skills/agy-claude-loop/scripts/audit_commits.py --repo "<repo_path>" --base "<base_commit>" --json
-   python3 ~/.agents/skills/agy-claude-loop/scripts/loopctl.py record --repo "<repo_path>" --run-id "<run_id>" --role "<claude|codex|agy>" --event delivery --summary "<一句话交付总结>" --commits "<提交链>" --body "<分阶段commit + 门禁实测数字 + 遗留说明>" --json
+   python3 ~/.agents/skills/harness-loop/scripts/audit_commits.py --repo "<repo_path>" --base "<base_commit>" --json
+   python3 ~/.agents/skills/harness-loop/scripts/loopctl.py record --repo "<repo_path>" --run-id "<run_id>" --role "<claude|codex|agy>" --event delivery --summary "<一句话交付总结>" --commits "<提交链>" --body "<分阶段commit + 门禁实测数字 + 遗留说明>" --json
 ```
 
 ---
@@ -107,6 +107,6 @@ Post-Verifier 独立代码审查与视觉核验发现了以下具体问题，请
 2. 逐张读图复核更新后的截图：<列出截图路径>
 3. 更新 `docs/DEVLOG.md` 并本地 `rtk git commit`（无 AI 署名，不 `git push`）
 4. 自检并写入新一轮交卷记录：
-   python3 ~/.agents/skills/agy-claude-loop/scripts/audit_commits.py --repo "<repo_path>" --base "<base_commit>" --json
-   python3 ~/.agents/skills/agy-claude-loop/scripts/loopctl.py record --repo "<repo_path>" --run-id "<run_id>" --role "<claude|codex|agy>" --event delivery --summary "<返工修复完成摘要>" --commits "<新增commit>" --body "<逐条修复对照 + 最新门禁数字>" --json
+   python3 ~/.agents/skills/harness-loop/scripts/audit_commits.py --repo "<repo_path>" --base "<base_commit>" --json
+   python3 ~/.agents/skills/harness-loop/scripts/loopctl.py record --repo "<repo_path>" --run-id "<run_id>" --role "<claude|codex|agy>" --event delivery --summary "<返工修复完成摘要>" --commits "<新增commit>" --body "<逐条修复对照 + 最新门禁数字>" --json
 ```

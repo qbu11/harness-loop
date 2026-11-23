@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zero-dependency isolated unit test suite for agy-claude-loop scripts."""
+"""Zero-dependency isolated unit test suite for harness-loop scripts."""
 
 from __future__ import annotations
 
@@ -78,10 +78,40 @@ class ModelAliasAndArgvTests(unittest.TestCase):
         cmds = loopctl.format_all_harness_commands(manifest)
         self.assertEqual(cmds["agy"]["uri"], "conversation://aaaa1111-bbbb-cccc-dddd-eeeeffff0000")
         self.assertIn("python3 -B", cmds["agy"]["terminal_view"])
+        self.assertIn("harness-loop", cmds["agy"]["terminal_view"])
         self.assertEqual(
             cmds["codex"]["resume"],
             'cd "/tmp/sample-repo" && codex resume 11112222-3333-4444-5555-666677778888',
         )
+
+    def test_recursion_depth_guardrail_and_legacy_fallback(self) -> None:
+        orig_new = os.environ.pop("HARNESS_LOOP_DEPTH", None)
+        orig_old = os.environ.pop("AGY_LOOP_DEPTH", None)
+        try:
+            ok, depth, env = loopctl.check_recursion_depth(False)
+            self.assertTrue(ok)
+            self.assertEqual(depth, 0)
+            self.assertEqual(env["HARNESS_LOOP_DEPTH"], "1")
+            self.assertEqual(env["AGY_LOOP_DEPTH"], "1")
+
+            os.environ["AGY_LOOP_DEPTH"] = "2"
+            ok2, depth2, _ = loopctl.check_recursion_depth(False)
+            self.assertFalse(ok2)
+            self.assertEqual(depth2, 2)
+
+            os.environ.pop("AGY_LOOP_DEPTH", None)
+            os.environ["HARNESS_LOOP_DEPTH"] = "2"
+            ok3, depth3, env3 = loopctl.check_recursion_depth(True)
+            self.assertTrue(ok3)
+            self.assertEqual(depth3, 2)
+            self.assertEqual(env3["HARNESS_LOOP_DEPTH"], "3")
+        finally:
+            os.environ.pop("HARNESS_LOOP_DEPTH", None)
+            os.environ.pop("AGY_LOOP_DEPTH", None)
+            if orig_new is not None:
+                os.environ["HARNESS_LOOP_DEPTH"] = orig_new
+            if orig_old is not None:
+                os.environ["AGY_LOOP_DEPTH"] = orig_old
 
 
 class CliWorkflowAndSnippetTests(unittest.TestCase):
@@ -145,6 +175,7 @@ class CliWorkflowAndSnippetTests(unittest.TestCase):
             self.assertEqual(s2["status"], "already_present")
             agents_txt = (repo / "AGENTS.md").read_text(encoding="utf-8")
             self.assertEqual(agents_txt.count("## 多 Harness 协作角色"), 1)
+            self.assertIn("harness-loop", agents_txt)
 
     def test_doctor_json_schema(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -160,6 +191,7 @@ class CliWorkflowAndSnippetTests(unittest.TestCase):
             self.assertIn("binaries", doc)
             self.assertIn("skill_mounts", doc)
             self.assertIn("agy_brain_roots", doc)
+            self.assertIn("harness-loop", doc["skill_mounts"]["canonical"]["path"])
             self.assertEqual(Path(doc["skill_root"]).resolve(), SCRIPTS_DIR.parent.resolve())
 
 

@@ -1,8 +1,8 @@
 interface:
-  display_name: "AGY-Claude-Codex Loop"
-  short_description: "Coordinate traceable AGY, Claude Code, and Codex loops."
+  display_name: "Harness Loop"
+  short_description: "Coordinate traceable multi-harness AI coding loops."
   brand_color: "#2D3340"
-  default_prompt: "Use $agy-claude-loop to run or inspect a multi-harness Antigravity, Claude Code, and Codex (including GPT-6.2-Sol) architecture, execution, consultation, and verification loop."
+  default_prompt: "Use $harness-loop to run or inspect a traceable multi-harness (Antigravity, Claude Code, Codex, and extensible CLI harnesses) architecture, execution, consultation, and verification loop."
 
 policy:
   allow_implicit_invocation: true

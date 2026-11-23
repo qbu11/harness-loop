@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Cross-harness bridge and traceable dialogue ledger CLI for agy-claude-loop.
+"""Cross-harness bridge and traceable dialogue ledger CLI for harness-loop.
 
-Coordinates Antigravity (agy), Claude Code (claude), and Codex (codex, incl.
-GPT-6.2-Sol) as interchangeable Architect / Executor / Verifier / Advisor roles,
-supporting cross-harness read-only consultation (`consult`), write delegation
-(`delegate`), live progress inspection (`inspect*`), and git-ignored traceable
-dialogue logs (`<repo>/.agent-loop/LATEST.md`) using only the Python 3 stdlib.
+Coordinates multiple AI coding harnesses — built-in Antigravity (agy), Claude Code
+(claude), and Codex (codex, incl. GPT-6.2-Sol), extensible to future harnesses —
+as interchangeable Architect / Executor / Verifier / Advisor roles, supporting
+cross-harness read-only consultation (`consult`), write delegation (`delegate`),
+live progress inspection (`inspect*`), and git-ignored traceable dialogue logs
+(`<repo>/.agent-loop/LATEST.md`) using only the Python 3 stdlib.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
+SKILL_NAME = "harness-loop"
 LOOP_DIR_NAME = ".agent-loop"
 EVENTS_FILE = "events.jsonl"
 MANIFEST_FILE = "manifest.json"
@@ -478,7 +480,7 @@ def format_all_harness_commands(manifest: dict[str, Any]) -> dict[str, dict[str,
         if (AGY_CLI_BRAIN_ROOT / agy_sid).exists():
             agy_cmds["cli_resume"] = f"agy --conversation {agy_sid}"
         agy_cmds["terminal_view"] = (
-            f"python3 -B ~/.agents/skills/agy-claude-loop/scripts/loopctl.py view --agy-id {agy_sid} --last 10"
+            f"python3 -B ~/.agents/skills/{SKILL_NAME}/scripts/loopctl.py view --agy-id {agy_sid} --last 10"
         )
 
     codex_cmds: dict[str, str] = {}
@@ -486,7 +488,7 @@ def format_all_harness_commands(manifest: dict[str, Any]) -> dict[str, dict[str,
         if repo_str:
             codex_cmds["resume"] = f'cd "{repo_str}" && codex resume {codex_sid}'
             codex_cmds["terminal_view"] = (
-                f'python3 -B ~/.agents/skills/agy-claude-loop/scripts/loopctl.py view --repo "{repo_str}" --target codex'
+                f'python3 -B ~/.agents/skills/{SKILL_NAME}/scripts/loopctl.py view --repo "{repo_str}" --target codex'
             )
         else:
             codex_cmds["resume"] = f"codex resume {codex_sid}"
@@ -1118,15 +1120,19 @@ def clean_agy_user_text(raw: str) -> str:
 
 
 def check_recursion_depth(allow_nested: bool) -> tuple[bool, int, dict[str, str]]:
-    """Enforce AGY_LOOP_DEPTH < 2 guardrail unless --allow-nested is given."""
-    try:
-        depth = int(os.environ.get("AGY_LOOP_DEPTH", "0"))
-    except ValueError:
-        depth = 0
+    """Enforce HARNESS_LOOP_DEPTH < 2 guardrail (with AGY_LOOP_DEPTH fallback)."""
+    depth = 0
+    for var_name in ("HARNESS_LOOP_DEPTH", "AGY_LOOP_DEPTH"):
+        try:
+            depth = max(depth, int(os.environ.get(var_name, "0")))
+        except ValueError:
+            continue
     if depth >= 2 and not allow_nested:
         return False, depth, dict(os.environ)
     next_env = dict(os.environ)
-    next_env["AGY_LOOP_DEPTH"] = str(depth + 1)
+    next_depth = str(depth + 1)
+    next_env["HARNESS_LOOP_DEPTH"] = next_depth
+    next_env["AGY_LOOP_DEPTH"] = next_depth
     return True, depth, next_env
 
 
@@ -3110,7 +3116,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-AGENTS_SNIPPET = """## 多 Harness 协作角色（默认口径，均调用 `agy-claude-loop`）
+AGENTS_SNIPPET = f"""## 多 Harness 协作角色（默认口径，均调用 `{SKILL_NAME}`）
 
 - **Antigravity（`agy`）**：默认任 **Architect + Post-Verifier + 体验官**——负责项目审查、撰写 PRD/Tech-Spec/Test-Plan/Handoff 规格包，用 `loopctl.py delegate` 派活并挂 `loopctl.py watch` 零 Token 守候，完工后独立四维终审、实机体验并向用户结项。
 - **Claude Code（`claude`）**：默认任 **Executor**（复杂需求默认首行 `ultracode`）——严格按规格包 CUI-First 分阶段施工与提交，遇口径疑问可 `loopctl.py consult` 取经，收口前自跑 `audit_commits.py` 并回写 `.agent-loop/LATEST.md`。
@@ -3191,10 +3197,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         }
 
     mount_paths = {
-        "canonical": Path.home() / ".agents" / "skills" / "agy-claude-loop",
-        "claude": Path.home() / ".claude" / "skills" / "agy-claude-loop",
-        "codex": Path.home() / ".codex" / "skills" / "agy-claude-loop",
-        "antigravity": Path.home() / ".gemini" / "config" / "skills" / "agy-claude-loop",
+        "canonical": Path.home() / ".agents" / "skills" / SKILL_NAME,
+        "claude": Path.home() / ".claude" / "skills" / SKILL_NAME,
+        "codex": Path.home() / ".codex" / "skills" / SKILL_NAME,
+        "antigravity": Path.home() / ".gemini" / "config" / "skills" / SKILL_NAME,
     }
     skill_mounts: dict[str, dict[str, Any]] = {}
     for label, mp in mount_paths.items():
@@ -3224,7 +3230,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 
-    print("=== agy-claude-loop doctor ===")
+    print(f"=== {SKILL_NAME} doctor ===")
     print(f"Python: {report['python_version']}")
     print(f"Skill Root: {report['skill_root']}")
     print("\n[Binaries]")
@@ -3245,7 +3251,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AGY <-> Claude Code <-> Codex traceable loop controller")
+    parser = argparse.ArgumentParser(
+        description="Multi-harness traceable loop controller (Antigravity, Claude Code, Codex & extensible harnesses)"
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     def _add_ultracode_args(p: argparse.ArgumentParser) -> None:
