@@ -61,6 +61,108 @@ class ModelAliasAndArgvTests(unittest.TestCase):
             self.assertLess(argv.index("-m"), argv.index(sid))
             self.assertEqual(argv[-2:], [sid, args[2]])
 
+    def test_codex_reasoning_effort_argv_and_dry_run(self) -> None:
+        sid = "00000000-1111-2222-3333-444444444444"
+        c_argv = loopctl.build_consult_argv(
+            "codex",
+            Path("/tmp/demo"),
+            "review diff",
+            model="gpt-6.2-sol",
+            reasoning_effort="high",
+        )
+        self.assertIn("-m", c_argv)
+        self.assertEqual(c_argv[c_argv.index("-m") + 1], "gpt-6.2-sol")
+        self.assertIn("-c", c_argv)
+        self.assertEqual(c_argv[c_argv.index("-c") + 1], 'model_reasoning_effort="high"')
+        self.assertLess(c_argv.index("-c"), c_argv.index("review diff"))
+
+        c_res_argv = loopctl.build_consult_argv(
+            "codex",
+            Path("/tmp/demo"),
+            "round 2",
+            model="gpt-6.2-sol",
+            session_id=sid,
+            reasoning_effort="xhigh",
+        )
+        self.assertEqual(c_res_argv[1:3], ["exec", "resume"])
+        self.assertIn("-c", c_res_argv)
+        self.assertEqual(c_res_argv[c_res_argv.index("-c") + 1], 'model_reasoning_effort="xhigh"')
+        self.assertLess(c_res_argv.index("-c"), c_res_argv.index(sid))
+        self.assertEqual(c_res_argv[-2:], [sid, "round 2"])
+
+        d_argv = loopctl.build_delegate_argv(
+            "codex",
+            Path("/tmp/demo"),
+            "impl",
+            model="gpt-6.2-sol",
+            reasoning_effort="xhigh",
+        )
+        self.assertIn("-c", d_argv)
+        self.assertEqual(d_argv[d_argv.index("-c") + 1], 'model_reasoning_effort="xhigh"')
+        self.assertLess(d_argv.index("-c"), d_argv.index("impl"))
+
+        for harness in ("agy", "claude"):
+            non_codex_c = loopctl.build_consult_argv(
+                harness,
+                Path("/tmp/demo"),
+                "check",
+                reasoning_effort="xhigh",
+            )
+            non_codex_d = loopctl.build_delegate_argv(
+                harness,
+                Path("/tmp/demo"),
+                "do work",
+                reasoning_effort="high",
+            )
+            self.assertNotIn("-c", non_codex_c)
+            self.assertNotIn("-c", non_codex_d)
+            self.assertEqual(non_codex_c[-1], "check")
+            self.assertEqual(non_codex_d[-1], "do work")
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "home"
+            fake_home.mkdir()
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            env = dict(os.environ, HOME=str(fake_home))
+
+            subprocess.run(
+                [sys.executable, "-B", str(LOOPCTL_PATH), "init", "--repo", str(repo), "--slug", "effort-smoke", "--json"],
+                env=env, check=True, stdout=subprocess.DEVNULL,
+            )
+            dry_c = subprocess.run(
+                [
+                    sys.executable, "-B", str(LOOPCTL_PATH), "consult",
+                    "--repo", str(repo), "--from", "agy", "--to", "codex",
+                    "--model", "6.2-sol", "--reasoning-effort", "xhigh",
+                    "--prompt", "review", "--dry-run", "--json",
+                ],
+                env=env, capture_output=True, text=True, check=True,
+            )
+            cdata = json.loads(dry_c.stdout)
+            self.assertTrue(cdata["ok"])
+            self.assertEqual(cdata["model"], "gpt-6.2-sol")
+            self.assertEqual(cdata["reasoning_effort"], "xhigh")
+            self.assertIn("-c", cdata["argv"])
+            self.assertEqual(cdata["argv"][cdata["argv"].index("-c") + 1], 'model_reasoning_effort="xhigh"')
+
+            dry_d = subprocess.run(
+                [
+                    sys.executable, "-B", str(LOOPCTL_PATH), "delegate",
+                    "--repo", str(repo), "--from", "agy", "--to", "codex",
+                    "--model", "6.2-sol", "--reasoning-effort", "high",
+                    "--prompt", "implement module", "--dry-run", "--json",
+                ],
+                env=env, capture_output=True, text=True, check=True,
+            )
+            ddata = json.loads(dry_d.stdout)
+            self.assertTrue(ddata["ok"])
+            self.assertEqual(ddata["model"], "gpt-6.2-sol")
+            self.assertEqual(ddata["reasoning_effort"], "high")
+            self.assertIn("-c", ddata["argv"])
+            self.assertEqual(ddata["argv"][ddata["argv"].index("-c") + 1], 'model_reasoning_effort="high"')
+
     def test_ultracode_prefix_applied_by_complexity(self) -> None:
         self.assertTrue(loopctl.apply_ultracode_prefix("do work", True).startswith("ultracode\n\n"))
         self.assertEqual(loopctl.apply_ultracode_prefix("do work", False), "do work")

@@ -81,6 +81,27 @@ python3 -B ~/.agents/skills/harness-loop/scripts/audit_commits.py \
 - 深/浅双主题与大字版下的文字对比度、卡片对齐、零毛玻璃（`backdrop-filter: none`）；
 - 不同视口下宽屏分栏与窄屏降级是否无横向溢出、破图或乱码。
 
+### 跨端对抗性代码审查规范（推荐 Codex `gpt-6.2-sol`）
+重要分支或合并前，建议由独立后端审查模型（如 Codex `gpt-6.2-sol`）加扫一轮只读对抗审校（见 `doc-pack-templates.md §5`）：
+- **按风险分级选择推理深度**：
+  ```bash
+  # 常规变更（默认 high）
+  python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py consult \
+    --repo "<repo>" --from agy --to codex --model gpt-6.2-sol --reasoning-effort high --prompt-file "<review.md>" --json
+
+  # 触及资金/计费、权限与登录、对外发消息或关键外部/持久化数据写入（升至 xhigh）
+  python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py consult \
+    --repo "<repo>" --from agy --to codex --model gpt-6.2-sol --reasoning-effort xhigh --prompt-file "<review.md>" --json
+  ```
+- **两级发现标准**：
+  - **阻断项（Blocking）**：仅当问题会导致算错钱、数据丢失或损坏、越权或登录鉴权漏洞、对外错发消息或错写关键外部数据、发布或核心链路事故，或破坏显式契约/测试，**且审查者能写清具体触发路径与 `文件:行号`** 时，才判为阻断；
+  - **建议项（Advisory）**：依赖多重罕见巧合的极端假设、风格偏好或非关键重构仅记为建议，不挡放行。
+- **最多审 2 轮**：达 `max_rounds`（默认 `2`）仍未过即拦截升级为 `ESCALATED`，由主控端汇总证据与选项交用户拍板。
+- **纠错变检查棘轮（Ratchet）**：
+  - 用户纠正或审查退回一类错时，在同次修复里尽量把该类规则沉淀为机械检查（类型约束、lint 或守卫测试，报错写明改法），或通过重构接口/目录让错误写法无法成立；确实做不到时再写进文字规则并注明原因；
+  - 新增检查时，历史旧违规记入欠账清单只减不增，新代码零容忍；文字规则已被检查完全守住的，删掉冗余文字或仅留一句指向检查；
+  - 每次改动前列全同类入口（深浅色、桌面与窄屏、文档/文案/测试/配置），改完反搜旧说法残留，按真实用户路径走通后再交卷。
+
 ### 裁决与返工
 - 存在任何阻断或中高风险隐患 → 记录 `record --event verifier_audit --verdict NEEDS_FIX`，按 `doc-pack-templates.md §4` 生成精确 `文件:行号` 返工单并调 `loopctl.py delegate --rework` 打回修复。
 - **自动返工硬上限**：`max_rounds` 默认 `2`；达到上限或同一错误跨轮复现时，继续 `delegate --rework` 会被强制拦截并置为 `ESCALATED`，此时改用 `loopctl.py record --event escalate --summary "<阻塞原因与备选方案>"` 升级用户决定（用户确认后可加 `--force` 放行）。

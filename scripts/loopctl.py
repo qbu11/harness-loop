@@ -52,6 +52,7 @@ CODEX_INDEX_FILE = Path.home() / ".codex" / "session_index.jsonl"
 
 DEFAULT_MAX_ROUNDS = 2
 TERMINAL_PHASES = ("DONE", "ESCALATED", "ABORTED")
+CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 
 VALID_EVENTS = (
     "audit_summary",
@@ -2144,17 +2145,23 @@ def _build_codex_exec_argv(
     out_target: str,
     model: str = "",
     session_id: str = "",
+    reasoning_effort: str = "",
 ) -> list[str]:
     """Construct `codex exec` or `codex exec resume` argv with options before positionals."""
+    effort = (reasoning_effort or "").strip().lower()
     if session_id:
         argv = [binary, "exec", "resume", "--json", "-o", out_target]
         if model:
             argv.extend(["-m", model])
+        if effort:
+            argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
         argv.extend([session_id, prompt_text])
         return argv
     argv = [binary, "exec", "-C", str(repo), "-s", sandbox, "--json", "-o", out_target]
     if model:
         argv.extend(["-m", model])
+    if effort:
+        argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
     argv.append(prompt_text)
     return argv
 
@@ -2167,6 +2174,7 @@ def build_consult_argv(
     model: str = "",
     session_id: str = "",
     reply_file: Path | None = None,
+    reasoning_effort: str = "",
 ) -> list[str]:
     """Construct read-only consultation CLI argv for agy, claude, or codex."""
     binary = harness_bin(to_harness) or to_harness
@@ -2198,6 +2206,7 @@ def build_consult_argv(
         out_target=out_target,
         model=model,
         session_id=session_id,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -2212,6 +2221,7 @@ def build_delegate_argv(
     sandbox: str = "workspace-write",
     last_msg_file: Path | None = None,
     sync: bool = False,
+    reasoning_effort: str = "",
 ) -> list[str]:
     """Construct execution/write CLI argv for agy, claude, or codex."""
     binary = harness_bin(to_harness) or to_harness
@@ -2241,6 +2251,7 @@ def build_delegate_argv(
             out_target=out_target,
             model=model,
             session_id=session_id,
+            reasoning_effort=reasoning_effort,
         )
 
     # agy accept-edits
@@ -3094,6 +3105,7 @@ def cmd_consult(args: argparse.Namespace) -> int:
         return 1
 
     model = resolve_harness_model(manifest, args.to, args.model)
+    reasoning_effort = (getattr(args, "reasoning_effort", "") or "").strip().lower()
     sid = args.session_id or manifest["sessions"][args.to].get("session_id") or ""
     ts_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
     rand4 = secrets.token_hex(2)
@@ -3108,7 +3120,15 @@ def cmd_consult(args: argparse.Namespace) -> int:
     prompt_file = run_dir / f"CONSULT-{job_id}.md"
     prompt_file.write_text(prompt_text, encoding="utf-8")
 
-    argv = build_consult_argv(args.to, workdir, prompt_text, model=model, session_id=sid, reply_file=reply_file)
+    argv = build_consult_argv(
+        args.to,
+        workdir,
+        prompt_text,
+        model=model,
+        session_id=sid,
+        reply_file=reply_file,
+        reasoning_effort=reasoning_effort,
+    )
     use_tmux = _should_use_tmux(getattr(args, "tmux", None)) if not args.dry_run else bool(
         getattr(args, "tmux", None) if getattr(args, "tmux", None) is not None else tmux_bin()
     )
@@ -3122,7 +3142,13 @@ def cmd_consult(args: argparse.Namespace) -> int:
         event="cross_consult",
         summary=args.summary or f"{args.from_role} 向 {args.to} 发起只读评审/咨询",
         body=prompt_text,
-        extra={"target": args.to, "model": model, "workdir": str(workdir), "job_id": job_id},
+        extra={
+            "target": args.to,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "workdir": str(workdir),
+            "job_id": job_id,
+        },
     )
 
     if args.dry_run:
@@ -3137,6 +3163,7 @@ def cmd_consult(args: argparse.Namespace) -> int:
             "tmux": use_tmux,
             "tmux_session": tmux_sess if use_tmux else "",
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "session_id": sid,
             "argv": argv,
             "dialogue_md": str(run_dir / DIALOGUE_FILE),
@@ -3165,6 +3192,7 @@ def cmd_consult(args: argparse.Namespace) -> int:
             "label": getattr(args, "label", "") or win_name,
             "harness": args.to,
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "mode": "consult",
             "workdir": str(workdir),
             "branch": branch,
@@ -3298,6 +3326,7 @@ def cmd_consult(args: argparse.Namespace) -> int:
         "to": args.to,
         "workdir": str(workdir),
         "model": model,
+        "reasoning_effort": reasoning_effort,
         "session_id": final_sid,
         "reply": reply_text,
         "dialogue_md": str(run_dir / DIALOGUE_FILE),
@@ -3361,6 +3390,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         return 1
 
     model = resolve_harness_model(manifest, to_harness, args.model, role_name=args.role_name, track=track or None)
+    reasoning_effort = (getattr(args, "reasoning_effort", "") or "").strip().lower()
     sid = args.session_id or manifest["sessions"][to_harness].get("session_id") or ""
     use_ultracode = False
     if to_harness == "claude":
@@ -3412,6 +3442,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         sandbox=args.sandbox,
         last_msg_file=last_msg_file,
         sync=sync_mode,
+        reasoning_effort=reasoning_effort,
     )
 
     use_tmux = _should_use_tmux(getattr(args, "tmux", None)) if not args.dry_run else bool(
@@ -3444,6 +3475,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         extra={
             "target": to_harness,
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "ultracode": use_ultracode,
             "workdir": str(workdir),
             "branch": branch,
@@ -3475,6 +3507,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "tmux_session": tmux_sess if use_tmux else "",
             "tmux_window_name": win_name if use_tmux else "",
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "ultracode": use_ultracode,
             "sync": sync_mode,
             "argv": argv,
@@ -3651,6 +3684,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
                 "label": label or win_name,
                 "harness": to_harness,
                 "model": model,
+                "reasoning_effort": reasoning_effort,
                 "mode": "write",
                 "workdir": str(workdir),
                 "branch": branch,
@@ -3756,6 +3790,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "label": label or win_name,
             "harness": to_harness,
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "mode": "write",
             "workdir": str(workdir),
             "branch": branch,
@@ -5604,7 +5639,7 @@ AGENTS_SNIPPET = f"""## 多 Harness 协作角色（默认口径，均调用 `{SK
 
 - **Antigravity（`agy`）**：默认任 **Architect + Post-Verifier + 体验官**——负责项目审查、撰写 PRD/Tech-Spec/Test-Plan/Handoff 规格包，用 `loopctl.py delegate`（默认跑进 `tmux` 总览看板与分窗）派活并挂 `loopctl.py watch` 零 Token 守候，完工后独立四维终审、实机体验并向用户结项。
 - **Claude Code（`claude`）**：默认任 **Executor**（复杂需求默认首行 `ultracode`）——严格按规格包 CUI-First 分阶段施工与提交，遇口径疑问可 `loopctl.py consult` 取经，收口前自跑 `audit_commits.py` 并回写 `.agent-loop/LATEST.md`。
-- **Codex（`codex`，如 `GPT-6.2-Sol`）**：按用户指定任 **Executor / 审校顾问**——承担开发实现或对抗性代码审校，保持原生会话可追溯（`codex resume`），进度与交付同步至 `.agent-loop/LATEST.md`。
+- **Codex（`codex`，如 `GPT-6.2-Sol`）**：按用户指定任 **Executor / 审校顾问**——承担独立模块实现或合并前两级对抗性代码审校（可用 `--reasoning-effort high|xhigh` 分级、默认最多 2 轮），保持原生会话可追溯（`codex resume`），进度与交付同步至 `.agent-loop/LATEST.md`。
 """
 
 
@@ -5860,6 +5895,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_cons.add_argument("--from", dest="from_role", choices=ROLES_WITH_USER, required=True)
     p_cons.add_argument("--to", choices=HARNESSES, required=True)
     p_cons.add_argument("--model", default=None)
+    p_cons.add_argument(
+        "--reasoning-effort",
+        choices=CODEX_REASONING_EFFORTS,
+        default="",
+        help="Codex reasoning effort override (-c model_reasoning_effort=<level>)",
+    )
     p_cons.add_argument("--session-id", default="")
     p_cons.add_argument("--label", default="")
     p_cons.add_argument("--prompt", default="")
@@ -5883,6 +5924,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.add_argument("--wave", default="")
     p_del.add_argument("--label", default="")
     p_del.add_argument("--model", default=None)
+    p_del.add_argument(
+        "--reasoning-effort",
+        choices=CODEX_REASONING_EFFORTS,
+        default="",
+        help="Codex reasoning effort override (-c model_reasoning_effort=<level>)",
+    )
     p_del.add_argument("--session-id", default="")
     p_del.add_argument("--name", default="")
     p_del.add_argument("--prompt", default="")

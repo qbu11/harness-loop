@@ -165,7 +165,7 @@ Post-Verifier 独立审查发现以下问题，请在 `<workdir>` 逐条修复�
 
 1. **[严重度] `<相对路径:行号>` — `<一句话问题>`**
    - 现状与风险：<实际查到的代码/报错/截图证据>
-   - 修复要求：<明确改法，不留模糊空间>
+   - 修复要求：<明确改法，不留模糊空间；若该类错可由类型或守卫测试机械拦截，要求同次提交补齐检查并写清报错提示>
    - 补齐测试：<要求补充的单测或 E2E 断言>
 
 完成后请执行：
@@ -175,4 +175,27 @@ Post-Verifier 独立审查发现以下问题，请在 `<workdir>` 逐条修复�
 4. 自检并记入台账：
    python3 ~/.agents/skills/harness-loop/scripts/audit_commits.py --repo "<repo_path>" --base "<base_commit>" --stage <cui|full> --json
    python3 ~/.agents/skills/harness-loop/scripts/loopctl.py record --repo "<repo_path>" --role <claude|codex|agy> --event delivery --summary "<返工完成摘要>" --commits "<新增commit>" --body "<逐条修复对照 + 最新门禁数字>" --json
+```
+
+---
+
+## 5. 跨端对抗性审查提示词模板（只读 `consult`，推荐 Codex `gpt-6.2-sol`）
+
+> 适用场景：分支合并或核心改动落地前由独立审查端过一遍；常规改动传 `--reasoning-effort high`，触及资金/计费、权限/登录、对外发消息或关键数据写入传 `--reasoning-effort xhigh`。
+
+```text
+请作为独立代码审查员，只读审查 `<repo_path>` 中相对基线 `<base_commit>` 的完整改动（`git diff <base_commit>..HEAD` 及本次新增文件），按以下两级标准输出，勿擅自改文件：
+
+1. **阻断项（Blocking）**：仅列出明确会导致算错钱、数据丢失/损坏、越权或登录鉴权漏洞、对外错发消息/错写关键外部数据、发布或核心链路事故，或破坏显式契约/测试的问题；每条必须附 `文件:行号`、具体触发路径与建议修法。
+2. **建议项（Advisory）**：依赖多重罕见巧合的极端边界假设、代码风格或非关键优化放在本节，不阻断合并。
+3. **棘轮检查（Ratchet）**：检查本轮修复的缺陷或刚踩过的坑是否已尽量转为类型约束/守卫测试，防止同类错再次出现。
+
+请严格按以下三节作答：
+## 阻断项（必须写明文件:行号与触发路径）
+- （无则写“无”）
+
+## 建议项（不挡放行）
+- （无则写“无”）
+
+## 裁决：PASS | NEEDS_FIX
 ```

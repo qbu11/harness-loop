@@ -40,6 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/qbu11/harness-loop/main/install.sh 
    - 独立检查每里程碑（`M1`, `M2`...）后端先于前端纪律、工作区洁净、无 AI 署名、无残留失败截图与测试报告新鲜度。
 6. **清晰闭环终止与返工上限硬门禁（`DONE / ESCALATED / ABORTED`）**
    - `delegate --rework` 默认上限 `2` 轮，超限自动拦截并置 `ESCALATED`；`record --event signoff` 硬校验 `PASS` + 无活跃/失败任务 + `ux_walkthrough` 后才落为 `DONE`，也支持 `escalate` / `abort` 显式停机。
+   - 支持 Codex `--reasoning-effort <low|medium|high|xhigh>` 审查分级（常规 `high`、高危 `xhigh`）与两级对抗审校标准，只以可复现高危触发路径阻断放行。
 
 ---
 

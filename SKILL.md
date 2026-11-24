@@ -52,8 +52,8 @@ metadata:
 |---|---|---|
 | `loopctl.py init` | 初始化闭环、花名册与赛道 | `--repo <dir> --slug <slug> [--architect/--executor/--verifier] [--track k=h[:m]] [--max-rounds 2] [--tmux-session s] --json` |
 | `loopctl.py set-roster` | 运行中动态改角色/赛道/模型 | `--repo <dir> [--executor ...] [--track k=h[:m]] --json` |
-| `loopctl.py delegate` | **派发写任务（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] [--wave w] [--track t] [--label lbl] [--to h] [--model m] [--rework] [--force] [--tmux\|--no-tmux] --json` |
-| `loopctl.py consult` | **只读跨端评审（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] --from <h> --to <h> (--prompt\|--prompt-file) [--no-tmux] --json` |
+| `loopctl.py delegate` | **派发写任务（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] [--wave w] [--track t] [--label lbl] [--to h] [--model m] [--reasoning-effort low\|medium\|high\|xhigh] [--rework] [--force] [--tmux\|--no-tmux] --json` |
+| `loopctl.py consult` | **只读跨端评审（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] --from <h> --to <h> [--model m] [--reasoning-effort low\|medium\|high\|xhigh] (--prompt\|--prompt-file) [--no-tmux] --json` |
 | `loopctl.py watch` | **零 Token 守候单任务/整波** | `--repo <dir> (--job-id id \| --wave w \| --jobs id1,id2 \| --all-active \| --harness h) [--stall-timeout 600] --json` |
 | `loopctl.py tmux` | 看板、接入、抓屏、停止 | `status \| dashboard \| attach [--job-id id] \| tail [--job-id id] [--lines 40] \| stop (--job-id id\|--all)` |
 | `loopctl.py view` | **纯只读回放任意端会话全文** | `[--repo dir] [--target all\|dialogue\|claude\|codex\|agy] [--claude-id id] [--codex-id id] [--agy-id id] [--job-id id] [--last 10] [--full]` |
@@ -67,13 +67,14 @@ metadata:
 
 ## 4. 通用纪律与防踩坑规则
 
-1. **只读咨询 vs 写入派发分离**：拿不准架构/接口时调用 `consult`（强制只读）；写代码用 `delegate`（带同 `workdir` 防双写锁 + `HARNESS_LOOP_DEPTH < 2` 防递归）。
+1. **只读咨询与派活粒度**：拿不准架构/接口时调用 `consult`（强制只读）；大方案做独立盲审时，只向对方传用户原话与必要背景，不传主控草稿；写代码用 `delegate`（同 `workdir` 防双写锁 + `HARNESS_LOOP_DEPTH < 2`），几十行内小改或与页面来回对接口的微调由主控直接改，只将接口定死的独立成块模块外派。
 2. **默认继承目标 Harness 全局模型**：未显式指定模型时不传 `--model`/`-m`，且绝不跨端传递认证或 Provider 环境变量。详细模型别名与多赛道用法见 [references/cross-harness-mesh.md](references/cross-harness-mesh.md)。
-3. **复杂任务优先原生强编排**：Claude Code 多阶段任务保留首行 `ultracode`；Codex 多模块流结合 `codex-workflows`；注意 Codex macOS `workspace-write` 对 `.git/index.lock` 只读与禁绑本地端口限制。
-4. **文档包、并行提示词与验收**：
-   - 文档包骨架与三套执行官提示词模板见 [references/doc-pack-templates.md](references/doc-pack-templates.md)；
-   - Tmux 监测、四维终审与实机体验规范见 [references/verifier-and-ux-playbook.md](references/verifier-and-ux-playbook.md)。
-5. **操作安全红线**：禁用 `rm`（清理用 `mv <path> ~/.Trash/`）；Git 用 `rtk git`（若项目约定），不加 AI 署名、未经授权不 `git push`。
+3. **两级对抗审查与纠错棘轮**：用 Codex（推荐 `gpt-6.2-sol`）做合并前审查时，常规传 `--reasoning-effort high`，触及计费/权限/外部发信或关键持久化传 `xhigh`；仅“能说清触发路径的高危项”阻断放行，最多审 2 轮超限转 `ESCALATED`；同次返工尽量把被退回或被纠正的一类错转为类型约束或守卫测试。
+4. **复杂任务优先原生强编排**：Claude Code 多阶段任务保留首行 `ultracode`；Codex 多模块流结合 `codex-workflows`；注意 Codex macOS `workspace-write` 对 `.git/index.lock` 只读与禁绑本地端口限制。
+5. **文档包、并行提示词与验收**：
+   - 文档包骨架、三套执行官与对抗审查提示词模板见 [references/doc-pack-templates.md](references/doc-pack-templates.md)；
+   - Tmux 监测、四维终审、两级审查标准与实机体验规范见 [references/verifier-and-ux-playbook.md](references/verifier-and-ux-playbook.md)。
+6. **操作安全红线**：禁用 `rm`（清理用 `mv <path> ~/.Trash/`）；Git 用 `rtk git`（若项目约定），不加 AI 署名、未经授权不 `git push`。
 
 ---
 

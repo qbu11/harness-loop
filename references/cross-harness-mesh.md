@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | 任意端 | **Antigravity (`agy`)** | `agy -p --mode plan --output-format json [--model <m>]` | `agy -p --mode accept-edits --output-format json [--model <m>]` | `inspect --harness agy --agy-id <id>` |
 | 任意端 | **Claude Code (`claude`)** | `claude -p --permission-mode plan --output-format json [--model <m>]` | `claude --bg -n <名>`（自动进 tmux 窗执行 `claude attach`） | `inspect --harness claude --workdir <wt>` |
-| 任意端 | **Codex (`codex`)** | `codex exec -C <workdir> -s read-only --json -o <reply.md> [-m <m>]` | `codex exec -C <workdir> -s workspace-write --json -o <last.md> [-m <m>]` | `inspect --harness codex --workdir <wt> [--job-id <id>]` |
+| 任意端 | **Codex (`codex`)** | `codex exec -C <workdir> -s read-only --json -o <reply.md> [-m <m>] [-c model_reasoning_effort="<lvl>"]` | `codex exec -C <workdir> -s workspace-write --json -o <last.md> [-m <m>] [-c model_reasoning_effort="<lvl>"]` | `inspect --harness codex --workdir <wt> [--job-id <id>]` |
 
 **`loopctl.py` 自动执行的护栏与记账**：
 1. 注入 `HARNESS_LOOP_DEPTH`（兼容旧变量 `AGY_LOOP_DEPTH`），默认限制嵌套 `< 2`；
@@ -74,7 +74,12 @@ python3 -B "$HOME/.agents/skills/harness-loop/scripts/loopctl.py" watch \
 | **Antigravity** | `Gemini 4 Neon XHigh` / `Claude Opus 5.5 High` | `gemini-4-neon-xhigh` / `claude-opus-5-5-high` | 架构、文档包、终审 |
 | **Claude Code** | `opus` / `sonnet` | 原生透传 | 配合 `ultracode` 跑多阶段工作流 |
 
-> 显式指定的模型若在目标客户端不可用，CLI 返回非零时 `loopctl.py` 立即报错并拒绝绑定会话，不静默替换模型。
+> 显式指定的模型若在目标客户端不可用，CLI 返回非零时 `loopctl.py` 立即报错并拒绝绑定会话，不静默替换模型。  
+> Codex `consult`/`delegate` 另支持 `--reasoning-effort <low|medium|high|xhigh>`（映射为 `-c model_reasoning_effort="<level>"`），便于常规审查用 `high`、高危逻辑升至 `xhigh`。
+
+### 派活粒度与独立盲审协作原则
+1. **派活粒度门槛**：几十行以内的小改、修审查指出的局部问题、或需要与页面频繁来回对接口的微调，由主控端直接完成；只将接口边界已定死、与页面解耦的独立成块模块（后端服务、算法、数据处理、性能优化、复杂多步浏览器操作）派给子执行端，避免跨端写提示词与验收的成本高过改动本身。
+2. **大方案独立盲审**：遇到整体架构、数据存储或核心选型等重大决策时，主控端在起草自身方案的同时，可通过 `loopctl.py consult --to <advisor>` 让另一端独立出一版方案——**只传递用户原始诉求与客观背景，不传入己方草稿或倾向**；回收后由主控端对照真实代码与运行数据逐条核实，再向用户合并汇报一致结论、采纳或弃用理由，以及难以取舍的分歧选项。
 
 ---
 
