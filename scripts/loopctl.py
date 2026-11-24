@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -27,6 +28,12 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import provider_failover as pf  # noqa: E402
 
 
 SKILL_NAME = "harness-loop"
@@ -51,8 +58,18 @@ CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 CODEX_INDEX_FILE = Path.home() / ".codex" / "session_index.jsonl"
 
 DEFAULT_MAX_ROUNDS = 2
+DEFAULT_MAX_FAILOVERS = 2
 TERMINAL_PHASES = ("DONE", "ESCALATED", "ABORTED")
 CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+RECOVERY_MODES = ("auto", "resume", "checkpoint")
+TERMINAL_JOB_STATUSES = (
+    "COMPLETED",
+    "BLOCKED_OR_FAILED",
+    "PROCESS_EXITED_FAILED",
+    "STALLED",
+    "STOPPED",
+    "FAILOVER_SWITCHED",
+)
 
 VALID_EVENTS = (
     "audit_summary",
@@ -72,6 +89,7 @@ VALID_EVENTS = (
     "cross_feedback",
     "delegate_task",
     "delivery",
+    "failover",
 )
 
 EVENT_LABELS = {
@@ -92,6 +110,7 @@ EVENT_LABELS = {
     "cross_feedback": "跨端反馈 · 收到只读建议",
     "delegate_task": "跨端派活 · 下达修改与执行任务",
     "delivery": "执行交卷 · 成果同步入账",
+    "failover": "故障转移 · 切换上游与断点续传",
 }
 
 MODEL_ALIASES: dict[str, dict[str, str]] = {
@@ -508,6 +527,7 @@ def ensure_manifest_v2(manifest: dict[str, Any]) -> dict[str, Any]:
 
     manifest.setdefault("max_rounds", DEFAULT_MAX_ROUNDS)
     manifest.setdefault("terminal_reason", "")
+    manifest.setdefault("failover", {})
     manifest.setdefault("jobs", [])
     manifest.setdefault("tmux_session", "")
     manifest.setdefault("synced_cc_assistant_ts", [])
@@ -713,7 +733,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 def _summarize_job_status(job: dict[str, Any]) -> str:
     """Compute concise status label for a recorded job without slow CLI calls."""
     recorded = str(job.get("status") or "").strip()
-    if recorded in ("COMPLETED", "BLOCKED_OR_FAILED", "PROCESS_EXITED_FAILED", "STALLED", "STOPPED"):
+    if recorded in TERMINAL_JOB_STATUSES:
         return recorded
     ex = _is_job_exit_recorded(job)
     if ex is not None:
@@ -774,6 +794,28 @@ def render_dialogue(repo: Path, run_dir: Path) -> Path:
             model_disp = f"`{t_spec['model']}`" if t_spec.get("model") else "_继承全局默认_"
             lines.append(f"| `track:{t_name}` | `{t_spec['harness']}` | {model_disp} |")
 
+    failover_cfg = manifest.get("failover") if isinstance(manifest.get("failover"), dict) else {}
+    if failover_cfg:
+        lines.extend([
+            "",
+            "## 上游故障转移链路（CC Switch）",
+            "",
+            "| Harness | 首选上游 | 备用队列（按序尝试） | 恢复策略 | 上限 |",
+            "|---|---|---|---|---|",
+        ])
+        for h_key, policy in sorted(failover_cfg.items()):
+            if not isinstance(policy, dict):
+                continue
+            prim = policy.get("primary") or {}
+            prim_disp = f"`{prim.get('name') or prim.get('id')}`" if isinstance(prim, dict) and (prim.get("name") or prim.get("id")) else "_继承全局_"
+            fbs = policy.get("fallback_providers") or []
+            fb_disp = " → ".join(
+                f"`{fb.get('name') or fb.get('id')}`" for fb in fbs if isinstance(fb, dict) and (fb.get("name") or fb.get("id"))
+            ) or "_未设置_"
+            rmode = str(policy.get("recovery_mode") or "auto")
+            mfail = int(policy.get("max_failovers") or DEFAULT_MAX_FAILOVERS)
+            lines.append(f"| `{h_key}` | {prim_disp} | {fb_disp} | `{rmode}` | {mfail} |")
+
     lines.extend([
         "",
         "## 多端会话与 Tmux 实时导航",
@@ -812,6 +854,8 @@ def render_dialogue(repo: Path, run_dir: Path) -> Path:
             h_disp = j.get("harness") or "-"
             if j.get("model"):
                 h_disp = f"{h_disp}:`{j['model']}`"
+            if j.get("provider_name"):
+                h_disp = f"{h_disp} ({j['provider_name']})"
             wd = j.get("workdir") or str(repo)
             br = j.get("branch") or ""
             wd_disp = f"`{Path(wd).name}`" + (f" (`{br}`)" if br else "")
@@ -1037,13 +1081,20 @@ def read_cc_session_meta(path: Path) -> dict[str, str]:
     return meta
 
 
-def _read_tail_lines(path: Path, max_bytes: int = 4 * 1024 * 1024) -> list[str]:
-    """Read tail lines efficiently without loading huge multi-hundred-MB logs into memory."""
+def _read_tail_lines(path: Path, max_bytes: int = 4 * 1024 * 1024, *, min_offset: int = 0) -> list[str]:
+    """Read tail lines efficiently without loading huge logs, honoring optional min_offset."""
     size = path.stat().st_size
+    if min_offset > 0 and size <= min_offset:
+        return []
+    start = max(0, min_offset)
+    if size - start > max_bytes:
+        start = size - max_bytes
     with path.open("rb") as fh:
-        if size > max_bytes:
-            fh.seek(size - max_bytes)
+        if start > 0:
+            fh.seek(start)
             raw = fh.read().decode("utf-8", errors="replace")
+            if min_offset > 0 and start == min_offset:
+                return raw.splitlines()
             lines = raw.splitlines()
             return lines[1:] if len(lines) > 1 else lines
         return fh.read().decode("utf-8", errors="replace").splitlines()
@@ -1091,9 +1142,10 @@ def parse_cc_jsonl_tail(
     tail_turns: int,
     *,
     include_full_text: bool = False,
+    min_offset: int = 0,
 ) -> dict[str, Any]:
     """Parse recent turns and latest assistant/user telemetry from a Claude JSONL log."""
-    lines = _read_tail_lines(path)
+    lines = _read_tail_lines(path, min_offset=min_offset)
     turns: list[dict[str, Any]] = []
     last_record_type: str | None = None
     last_record_ts: str | None = None
@@ -1284,10 +1336,11 @@ def parse_codex_rollout_tail(
     tail_turns: int,
     *,
     include_full_text: bool = False,
+    min_offset: int = 0,
 ) -> dict[str, Any]:
     """Parse session_meta, recent turns, and task_complete from a Codex rollout JSONL."""
     meta = read_codex_session_meta(path)
-    lines = _read_tail_lines(path)
+    lines = _read_tail_lines(path, min_offset=min_offset)
     turns: list[dict[str, Any]] = []
     last_event_type: str | None = None
     last_event_ts: str | None = None
@@ -1475,7 +1528,7 @@ def find_active_write_conflicts(
             continue
         if job_wd != scope_dir:
             continue
-        if job.get("status") in ("COMPLETED", "BLOCKED_OR_FAILED", "PROCESS_EXITED_FAILED", "STALLED", "STOPPED"):
+        if job.get("status") in TERMINAL_JOB_STATUSES:
             continue
         if _is_job_exit_recorded(job) is not None:
             continue
@@ -1722,6 +1775,21 @@ def _format_live_stream_line(harness: str, raw_line: str) -> str:
     return f"[{hhmmss}] {raw_line.rstrip()}"
 
 
+def _apply_provider_env(
+    base_env: dict[str, str],
+    *,
+    env_unset: list[str] | tuple[str, ...] = (),
+    env_overrides: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Build sanitized subprocess env removing conflicting parent vars before overrides."""
+    env = dict(base_env)
+    for k in env_unset:
+        env.pop(str(k), None)
+    for k, v in (env_overrides or {}).items():
+        env[str(k)] = str(v)
+    return env
+
+
 def cmd__run_job(args: argparse.Namespace) -> int:
     """Internal pane runner started inside tmux to preserve streams, PID, and exit code."""
     spec_path = Path(args.spec).resolve()
@@ -1731,6 +1799,7 @@ def cmd__run_job(args: argparse.Namespace) -> int:
     wave = str(spec.get("wave") or "-")
     harness = str(spec.get("harness") or "")
     model = str(spec.get("model") or "") or "全局默认"
+    provider_name = str(spec.get("provider_name") or "")
     workdir = Path(str(spec.get("workdir") or ".")).resolve()
     branch = str(spec.get("branch") or "")
     attach_bg_id = str(spec.get("attach_bg_id") or "")
@@ -1738,7 +1807,8 @@ def cmd__run_job(args: argparse.Namespace) -> int:
     prompt_file = str(spec.get("prompt_file") or "")
 
     print("=" * 72)
-    print(f"[harness-loop] Job: {job_id} | Wave: {wave} | Harness: {harness} ({model})")
+    prov_part = f" · {provider_name}" if provider_name else ""
+    print(f"[harness-loop] Job: {job_id} | Wave: {wave} | Harness: {harness} ({model}{prov_part})")
     print(f"Workdir: {workdir}" + (f" [branch: {branch}]" if branch else ""))
     if prompt_file:
         print(f"Prompt : {prompt_file}")
@@ -1747,9 +1817,11 @@ def cmd__run_job(args: argparse.Namespace) -> int:
     print("Tmux   : 鼠标点底栏切窗 | Ctrl-b w 选窗 | Ctrl-b 0 回看板 | Ctrl-b d 后台离开(不中断任务)")
     print("=" * 72, flush=True)
 
-    env = dict(os.environ)
-    for k, v in (spec.get("env_overrides") or {}).items():
-        env[str(k)] = str(v)
+    env = _apply_provider_env(
+        os.environ,
+        env_unset=spec.get("env_unset") or (),
+        env_overrides=spec.get("env_overrides") or {},
+    )
 
     if attach_bg_id:
         binary = harness_bin("claude") or "claude"
@@ -1871,9 +1943,11 @@ def _collect_job_live_row(repo: Path, job: dict[str, Any], win_by_id: dict[str, 
 
     state = str(job.get("status") or "")
     ex = _is_job_exit_recorded(job)
-    if ex is not None:
+    if state == "FAILOVER_SWITCHED":
+        pass
+    elif ex is not None:
         state = "COMPLETED" if int(ex.get("exit_code", 1)) == 0 else "PROCESS_EXITED_FAILED"
-    elif state in ("COMPLETED", "BLOCKED_OR_FAILED", "PROCESS_EXITED_FAILED", "STALLED", "STOPPED"):
+    elif state in TERMINAL_JOB_STATUSES:
         pass
     elif harness == "claude" and (bg_id or sid) and job.get("attach_bg_id"):
         agents = query_claude_agents(workdir)
@@ -2175,6 +2249,7 @@ def build_consult_argv(
     session_id: str = "",
     reply_file: Path | None = None,
     reasoning_effort: str = "",
+    claude_settings_file: str = "",
 ) -> list[str]:
     """Construct read-only consultation CLI argv for agy, claude, or codex."""
     binary = harness_bin(to_harness) or to_harness
@@ -2191,6 +2266,8 @@ def build_consult_argv(
         argv = [binary, "-p", "--permission-mode", "plan", "--output-format", "json"]
         if model:
             argv.extend(["--model", model])
+        if claude_settings_file:
+            argv.extend(["--setting-sources", "project,local", "--settings", claude_settings_file])
         if session_id:
             argv.extend(["--resume", session_id])
         argv.append(prompt_text)
@@ -2222,6 +2299,8 @@ def build_delegate_argv(
     last_msg_file: Path | None = None,
     sync: bool = False,
     reasoning_effort: str = "",
+    claude_settings_file: str = "",
+    fork_session: bool = False,
 ) -> list[str]:
     """Construct execution/write CLI argv for agy, claude, or codex."""
     binary = harness_bin(to_harness) or to_harness
@@ -2230,14 +2309,20 @@ def build_delegate_argv(
             argv = [binary, "-p", "--permission-mode", "acceptEdits", "--output-format", "json"]
             if session_id:
                 argv.extend(["--resume", session_id])
+                if fork_session:
+                    argv.append("--fork-session")
         else:
             argv = [binary, "--bg"]
             if session_id:
                 argv.extend(["--resume", session_id])
+                if fork_session:
+                    argv.append("--fork-session")
             elif session_name:
                 argv.extend(["-n", session_name])
         if model:
             argv.extend(["--model", model])
+        if claude_settings_file:
+            argv.extend(["--setting-sources", "project,local", "--settings", claude_settings_file])
         argv.append(prompt_text)
         return argv
 
@@ -2578,7 +2663,7 @@ def _evaluate_signoff_gate(
         blockers.append(f"终审结论当前为 {cur_verdict}，需先通过 verifier_audit 并记录 --verdict PASS")
 
     jobs = [j for j in (manifest.get("jobs") or []) if isinstance(j, dict)]
-    terminal_set = {"COMPLETED", "BLOCKED_OR_FAILED", "PROCESS_EXITED_FAILED", "STALLED", "STOPPED"}
+    terminal_set = set(TERMINAL_JOB_STATUSES)
     completed_idx_by_workdir: dict[str, int] = {}
     completed_idx_by_label: dict[str, int] = {}
     job_statuses: list[str] = []
@@ -3079,6 +3164,365 @@ def _record_job_in_manifest(
         return manifest
 
 
+def _resolve_provider_runtime_for_job(
+    manifest: dict[str, Any],
+    harness: str,
+    run_slug: str,
+    job_id: str,
+    workdir: Path,
+    *,
+    explicit_provider: str = "",
+    dry_run: bool = False,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Resolve optional CC Switch provider and materialize isolated 0600 runtime config."""
+    selector = (explicit_provider or "").strip()
+    if not selector:
+        policy = (manifest.get("failover") or {}).get(harness)
+        if isinstance(policy, dict) and isinstance(policy.get("primary"), dict):
+            selector = str(policy["primary"].get("id") or policy["primary"].get("name") or "").strip()
+    if not selector:
+        return None, {"env_overrides": {}, "env_unset": []}
+
+    summary = pf.resolve_provider(harness, selector)
+    if harness in ("claude", "codex"):
+        rt = pf.materialize_provider_runtime(
+            harness,
+            summary["id"],
+            run_slug,
+            job_id,
+            workdir,
+            dry_run=dry_run,
+        )
+        return summary, rt
+    return summary, {"env_overrides": {}, "env_unset": [], "provider": summary}
+
+
+def _extract_job_log_offset(harness: str, workdir: Path, sid: str, job_meta: dict[str, Any] | None) -> tuple[str, int]:
+    """Capture baseline transcript/rollout file path + byte offset before Tier-1 resume."""
+    path: Path | None = None
+    if job_meta and job_meta.get("stdout_jsonl"):
+        cand = Path(str(job_meta["stdout_jsonl"]))
+        if cand.exists() and (harness != "claude" or cand.name.endswith(f"{sid}.jsonl")):
+            path = cand
+    if not path and harness == "claude" and sid:
+        path = find_cc_jsonl(workdir, sid)
+    elif not path and harness == "codex" and sid:
+        path = find_codex_rollout(workdir, sid)
+    if path and path.exists():
+        try:
+            return str(path), int(path.stat().st_size)
+        except OSError:
+            return str(path), 0
+    return "", 0
+
+
+def _spawn_worker_job(
+    *,
+    repo: Path,
+    run_dir: Path,
+    manifest: dict[str, Any],
+    next_env: dict[str, str],
+    to_harness: str,
+    workdir: Path,
+    branch: str,
+    job_id: str,
+    wave: str,
+    track: str,
+    label: str,
+    win_name: str,
+    role_name: str,
+    cli_model: str,
+    display_model: str,
+    reasoning_effort: str,
+    sid: str,
+    session_name: str,
+    prompt_text: str,
+    prompt_file: Path,
+    sandbox: str,
+    use_ultracode: bool,
+    use_tmux: bool,
+    tmux_sess: str,
+    provider_summary: dict[str, Any] | None = None,
+    runtime_info: dict[str, Any] | None = None,
+    fallback_providers: list[dict[str, Any]] | None = None,
+    fork_session: bool = False,
+    extra_job_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Unified background/tmux launcher used by both `cmd_delegate` and `_execute_failover`."""
+    jobs_dir = run_dir / JOBS_DIR
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    stdout_log = jobs_dir / f"{job_id}.jsonl"
+    last_msg_file = jobs_dir / f"{job_id}-last.md"
+    pid_file = jobs_dir / f"{job_id}.pid.json"
+    exit_file = jobs_dir / f"{job_id}.exit.json"
+    spec_file = jobs_dir / f"{job_id}.spec.json"
+
+    rt = runtime_info or {}
+    claude_settings_file = str(rt.get("settings_file") or "")
+    argv = build_delegate_argv(
+        to_harness,
+        workdir,
+        prompt_text,
+        model=cli_model,
+        session_id=sid,
+        session_name=session_name,
+        sandbox=sandbox,
+        last_msg_file=last_msg_file,
+        sync=False,
+        reasoning_effort=reasoning_effort,
+        claude_settings_file=claude_settings_file,
+        fork_session=fork_session,
+    )
+
+    env_unset = [str(k) for k in (rt.get("env_unset") or ())]
+    env_overrides: dict[str, str] = {
+        str(k): str(v) for k, v in (rt.get("env_overrides") or {}).items()
+    }
+    env_overrides["HARNESS_LOOP_DEPTH"] = next_env["HARNESS_LOOP_DEPTH"]
+    env_overrides["AGY_LOOP_DEPTH"] = next_env["AGY_LOOP_DEPTH"]
+    proc_env = _apply_provider_env(next_env, env_unset=env_unset, env_overrides=env_overrides)
+
+    prov_id = str((provider_summary or {}).get("id") or "")
+    prov_name = str((provider_summary or {}).get("name") or "")
+    prov_url = str((provider_summary or {}).get("base_url") or "")
+    runtime_dir = str(rt.get("runtime_dir") or "")
+
+    extra = dict(extra_job_fields or {})
+
+    if to_harness == "claude":
+        dispatch_ts = round(time.time(), 3)
+        proc = subprocess.run(
+            argv,
+            cwd=str(workdir),
+            env=proc_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        stdout = proc.stdout.strip()
+        if proc.returncode != 0:
+            return {
+                "ok": False,
+                "returncode": proc.returncode,
+                "stdout": stdout,
+                "stderr": proc.stderr.strip(),
+                "argv": argv,
+                "job_id": job_id,
+            }
+        m = re.search(r"\b([0-9a-f]{8})\b", stdout)
+        bg_id = m.group(1) if m else ""
+        time.sleep(0.5 if extra.get("fast_test") else 1.5)
+        agents = query_claude_agents(workdir)
+        matched = next((a for a in agents if (bg_id and a.get("id") == bg_id) or a.get("name") == session_name), None)
+        final_sid = (matched.get("sessionId") if matched else None) or sid
+        matched_bg = (matched.get("id") if matched else None) or bg_id
+        matched_name = (matched.get("name") if matched else None) or session_name
+        matched_kind = (matched.get("kind") if matched else None) or "background"
+        jsonl = find_cc_jsonl(workdir, final_sid or matched_bg or None)
+        if not final_sid and jsonl:
+            final_sid = jsonl.stem
+
+        resume_hint = f'cd "{workdir}" && claude --resume {final_sid}' if final_sid else (f"claude attach {matched_bg}" if matched_bg else "")
+        tmux_info: dict[str, Any] = {}
+        attach_target = matched_bg or final_sid
+        if use_tmux and attach_target:
+            spec_payload = {
+                "job_id": job_id,
+                "wave": wave or "-",
+                "label": label or win_name,
+                "harness": "claude",
+                "model": display_model,
+                "provider_name": prov_name,
+                "mode": "write",
+                "workdir": str(workdir),
+                "branch": branch,
+                "attach_bg_id": attach_target,
+                "prompt_file": str(prompt_file),
+                "resume_hint": resume_hint,
+                "env_unset": env_unset,
+                "env_overrides": env_overrides,
+            }
+            _atomic_write_text(spec_file, json.dumps(spec_payload, ensure_ascii=False, indent=2))
+            tmux_info = _launch_in_tmux(
+                tmux_sess,
+                repo,
+                spec_path=spec_file,
+                win_name=win_name,
+                workdir=workdir,
+                pid_file=None,
+                wait_for_child_pid=False,
+            )
+
+        job_meta: dict[str, Any] = {
+            "job_id": job_id,
+            "wave": wave,
+            "label": label or win_name,
+            "track": track,
+            "harness": "claude",
+            "role_name": role_name,
+            "mode": "write",
+            "workdir": str(workdir),
+            "branch": branch,
+            "pid": 0,
+            "bg_id": matched_bg,
+            "attach_bg_id": attach_target,
+            "session_id": final_sid,
+            "name": matched_name,
+            "kind": matched_kind,
+            "model": display_model,
+            "cli_model": cli_model,
+            "reasoning_effort": reasoning_effort,
+            "provider_id": prov_id,
+            "provider_name": prov_name,
+            "provider_base_url": prov_url,
+            "runtime_dir": runtime_dir,
+            "claude_settings_file": claude_settings_file,
+            "fallback_providers": list(fallback_providers or []),
+            "dispatch_ts": dispatch_ts,
+            "stdout_jsonl": str(jsonl) if jsonl else "",
+            "prompt_file": str(prompt_file),
+            "tmux_session": tmux_info.get("tmux_session", ""),
+            "tmux_window_index": tmux_info.get("tmux_window_index"),
+            "tmux_window_id": tmux_info.get("tmux_window_id", ""),
+            "tmux_window_name": tmux_info.get("tmux_window_name", ""),
+            "tmux_pane_id": tmux_info.get("tmux_pane_id", ""),
+            "tmux_pane_pid": tmux_info.get("tmux_pane_pid", 0),
+            "tmux_target": tmux_info.get("tmux_target", ""),
+            "status": "RUNNING",
+            "started_at": now_iso(),
+        }
+        job_meta.update({k: v for k, v in extra.items() if k != "fast_test"})
+        updated_manifest = _record_job_in_manifest(
+            repo,
+            run_dir,
+            job_meta,
+            harness="claude",
+            session_id=final_sid,
+            model=display_model,
+            bg_id=matched_bg,
+            name=matched_name,
+            kind=matched_kind,
+            log_path=str(jsonl) if jsonl else "",
+            dispatch_ts=dispatch_ts,
+            tmux_sess=tmux_info.get("tmux_session", ""),
+        )
+        return {
+            "ok": True,
+            "job_meta": job_meta,
+            "updated_manifest": updated_manifest,
+            "tmux_info": tmux_info,
+            "argv": argv,
+            "use_ultracode": use_ultracode,
+        }
+
+    # codex / agy background worker
+    dispatch_ts = round(time.time(), 3)
+    tmux_info = {}
+    if use_tmux:
+        spec_payload = {
+            "job_id": job_id,
+            "wave": wave or "-",
+            "label": label or win_name,
+            "harness": to_harness,
+            "model": display_model,
+            "provider_name": prov_name,
+            "reasoning_effort": reasoning_effort,
+            "mode": "write",
+            "workdir": str(workdir),
+            "branch": branch,
+            "argv": argv,
+            "env_unset": env_unset,
+            "env_overrides": env_overrides,
+            "prompt_file": str(prompt_file),
+            "stdout_jsonl": str(stdout_log),
+            "last_msg_file": str(last_msg_file),
+            "pid_file": str(pid_file),
+            "exit_file": str(exit_file),
+            "resume_hint": f'cd "{workdir}" && codex resume {sid}' if (to_harness == "codex" and sid) else "",
+        }
+        _atomic_write_text(spec_file, json.dumps(spec_payload, ensure_ascii=False, indent=2))
+        tmux_info = _launch_in_tmux(
+            tmux_sess,
+            repo,
+            spec_path=spec_file,
+            win_name=win_name,
+            workdir=workdir,
+            pid_file=pid_file,
+            wait_for_child_pid=True,
+        )
+        tracked_pid = tmux_info["child_pid"] or tmux_info["tmux_pane_pid"]
+    else:
+        log_fh = stdout_log.open("w", encoding="utf-8")
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(workdir),
+            env=proc_env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        log_fh.close()
+        tracked_pid = proc.pid
+
+    job_meta = {
+        "job_id": job_id,
+        "wave": wave,
+        "label": label or win_name,
+        "track": track,
+        "harness": to_harness,
+        "role_name": role_name,
+        "mode": "write",
+        "workdir": str(workdir),
+        "branch": branch,
+        "pid": tracked_pid,
+        "session_id": sid,
+        "model": display_model,
+        "cli_model": cli_model,
+        "reasoning_effort": reasoning_effort,
+        "provider_id": prov_id,
+        "provider_name": prov_name,
+        "provider_base_url": prov_url,
+        "runtime_dir": runtime_dir,
+        "fallback_providers": list(fallback_providers or []),
+        "dispatch_ts": dispatch_ts,
+        "stdout_jsonl": str(stdout_log),
+        "last_msg_file": str(last_msg_file),
+        "prompt_file": str(prompt_file),
+        "pid_file": str(pid_file) if use_tmux else "",
+        "exit_file": str(exit_file) if use_tmux else "",
+        "tmux_session": tmux_info.get("tmux_session", ""),
+        "tmux_window_index": tmux_info.get("tmux_window_index"),
+        "tmux_window_id": tmux_info.get("tmux_window_id", ""),
+        "tmux_window_name": tmux_info.get("tmux_window_name", ""),
+        "tmux_pane_id": tmux_info.get("tmux_pane_id", ""),
+        "tmux_pane_pid": tmux_info.get("tmux_pane_pid", 0),
+        "tmux_target": tmux_info.get("tmux_target", ""),
+        "status": "RUNNING",
+        "started_at": now_iso(),
+    }
+    job_meta.update({k: v for k, v in extra.items() if k != "fast_test"})
+    updated_manifest = _record_job_in_manifest(
+        repo,
+        run_dir,
+        job_meta,
+        harness=to_harness,
+        session_id=sid,
+        model=display_model,
+        dispatch_ts=dispatch_ts,
+        tmux_sess=tmux_info.get("tmux_session", ""),
+    )
+    return {
+        "ok": True,
+        "job_meta": job_meta,
+        "updated_manifest": updated_manifest,
+        "tmux_info": tmux_info,
+        "argv": argv,
+        "use_ultracode": use_ultracode,
+    }
+
+
 def cmd_consult(args: argparse.Namespace) -> int:
     ok_depth, depth, next_env = check_recursion_depth(args.allow_nested)
     if not ok_depth:
@@ -3120,14 +3564,27 @@ def cmd_consult(args: argparse.Namespace) -> int:
     prompt_file = run_dir / f"CONSULT-{job_id}.md"
     prompt_file.write_text(prompt_text, encoding="utf-8")
 
+    provider_summary, runtime_info = _resolve_provider_runtime_for_job(
+        manifest,
+        args.to,
+        str(manifest.get("slug") or repo.name),
+        job_id,
+        workdir,
+        explicit_provider=getattr(args, "provider", "") or "",
+        dry_run=bool(args.dry_run),
+    )
+    cli_model = model if (args.model or not provider_summary) else ""
+    display_model = model or (provider_summary.get("model") if provider_summary else "") or ""
+
     argv = build_consult_argv(
         args.to,
         workdir,
         prompt_text,
-        model=model,
+        model=cli_model,
         session_id=sid,
         reply_file=reply_file,
         reasoning_effort=reasoning_effort,
+        claude_settings_file=str(runtime_info.get("settings_file") or ""),
     )
     use_tmux = _should_use_tmux(getattr(args, "tmux", None)) if not args.dry_run else bool(
         getattr(args, "tmux", None) if getattr(args, "tmux", None) is not None else tmux_bin()
@@ -3144,7 +3601,8 @@ def cmd_consult(args: argparse.Namespace) -> int:
         body=prompt_text,
         extra={
             "target": args.to,
-            "model": model,
+            "model": display_model,
+            "provider": (provider_summary or {}).get("name") or "",
             "reasoning_effort": reasoning_effort,
             "workdir": str(workdir),
             "job_id": job_id,
@@ -3162,7 +3620,8 @@ def cmd_consult(args: argparse.Namespace) -> int:
             "branch": branch,
             "tmux": use_tmux,
             "tmux_session": tmux_sess if use_tmux else "",
-            "model": model,
+            "model": display_model,
+            "provider": provider_summary,
             "reasoning_effort": reasoning_effort,
             "session_id": sid,
             "argv": argv,
@@ -3176,10 +3635,13 @@ def cmd_consult(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": f"{args.to} CLI not found"}, ensure_ascii=False), file=sys.stderr)
         return 1
 
-    env_overrides = {
-        "HARNESS_LOOP_DEPTH": next_env["HARNESS_LOOP_DEPTH"],
-        "AGY_LOOP_DEPTH": next_env["AGY_LOOP_DEPTH"],
+    env_unset = [str(k) for k in (runtime_info.get("env_unset") or ())]
+    env_overrides: dict[str, str] = {
+        str(k): str(v) for k, v in (runtime_info.get("env_overrides") or {}).items()
     }
+    env_overrides["HARNESS_LOOP_DEPTH"] = next_env["HARNESS_LOOP_DEPTH"]
+    env_overrides["AGY_LOOP_DEPTH"] = next_env["AGY_LOOP_DEPTH"]
+    proc_env = _apply_provider_env(next_env, env_unset=env_unset, env_overrides=env_overrides)
     tmux_info: dict[str, Any] = {}
     returncode = 1
     stdout_text = ""
@@ -3191,12 +3653,14 @@ def cmd_consult(args: argparse.Namespace) -> int:
             "wave": "consult",
             "label": getattr(args, "label", "") or win_name,
             "harness": args.to,
-            "model": model,
+            "model": display_model,
+            "provider_name": (provider_summary or {}).get("name") or "",
             "reasoning_effort": reasoning_effort,
             "mode": "consult",
             "workdir": str(workdir),
             "branch": branch,
             "argv": argv,
+            "env_unset": env_unset,
             "env_overrides": env_overrides,
             "prompt_file": str(prompt_file),
             "stdout_jsonl": str(stdout_log),
@@ -3263,7 +3727,7 @@ def cmd_consult(args: argparse.Namespace) -> int:
             proc = subprocess.run(
                 argv,
                 cwd=str(workdir),
-                env=next_env,
+                env=proc_env,
                 capture_output=True,
                 text=True,
                 timeout=args.timeout,
@@ -3276,11 +3740,17 @@ def cmd_consult(args: argparse.Namespace) -> int:
         stdout_text = proc.stdout
         stderr_text = proc.stderr
 
+    if runtime_info.get("runtime_dir"):
+        try:
+            pf.cleanup_runtime_dir(runtime_info["runtime_dir"])
+        except OSError:
+            pass
+
     reply_text, new_sid = extract_reply_and_session(args.to, stdout_text, reply_file=reply_file)
     if returncode != 0 and not reply_text:
         if use_tmux:
             job_meta["status"] = "PROCESS_EXITED_FAILED"
-            _record_job_in_manifest(repo, run_dir, job_meta, harness=args.to, model=model, tmux_sess=tmux_sess)
+            _record_job_in_manifest(repo, run_dir, job_meta, harness=args.to, model=display_model, tmux_sess=tmux_sess)
         print(
             json.dumps(
                 {"ok": False, "returncode": returncode, "stderr": stderr_text.strip(), "stdout": stdout_text.strip()},
@@ -3300,13 +3770,13 @@ def cmd_consult(args: argparse.Namespace) -> int:
             job_meta,
             harness=args.to,
             session_id=final_sid,
-            model=model,
+            model=display_model,
             tmux_sess=tmux_sess,
         )
-    elif final_sid or model:
+    elif final_sid or display_model:
         with _manifest_lock(run_dir):
             manifest = load_manifest(run_dir)
-            _sync_discovered_session(repo, manifest, args.to, session_id=final_sid, model=model)
+            _sync_discovered_session(repo, manifest, args.to, session_id=final_sid, model=display_model)
             save_manifest(run_dir, manifest)
             render_dialogue(repo, run_dir)
 
@@ -3317,7 +3787,7 @@ def cmd_consult(args: argparse.Namespace) -> int:
         event="cross_feedback",
         summary=f"{args.to} 返回只读评审意见（回复给 {args.from_role}）",
         body=reply_text,
-        extra={"target": args.from_role, "model": model, "session_id": final_sid, "job_id": job_id},
+        extra={"target": args.from_role, "model": display_model, "provider": (provider_summary or {}).get("name") or "", "session_id": final_sid, "job_id": job_id},
     )
     out: dict[str, Any] = {
         "ok": True,
@@ -3325,7 +3795,8 @@ def cmd_consult(args: argparse.Namespace) -> int:
         "from": args.from_role,
         "to": args.to,
         "workdir": str(workdir),
-        "model": model,
+        "model": display_model,
+        "provider": provider_summary,
         "reasoning_effort": reasoning_effort,
         "session_id": final_sid,
         "reply": reply_text,
@@ -3423,6 +3894,28 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     prompt_file.write_text(prompt_text, encoding="utf-8")
     session_name = args.name or f"{manifest.get('slug')}: {label or track or args.role_name}"
 
+    provider_summary, runtime_info = _resolve_provider_runtime_for_job(
+        manifest,
+        to_harness,
+        str(manifest.get("slug") or repo.name),
+        job_id,
+        workdir,
+        explicit_provider=getattr(args, "provider", "") or "",
+        dry_run=bool(args.dry_run),
+    )
+    cli_model = model if (args.model or not provider_summary) else ""
+    display_model = model or (provider_summary.get("model") if provider_summary else "") or ""
+
+    fallback_raw = (getattr(args, "fallback", "") or "").strip()
+    fallback_providers: list[dict[str, Any]] = []
+    if fallback_raw:
+        exclude = [provider_summary["id"]] if provider_summary else []
+        fallback_providers = pf.expand_fallback_specs(to_harness, fallback_raw, exclude_ids=exclude)
+    else:
+        policy = (manifest.get("failover") or {}).get(to_harness)
+        if isinstance(policy, dict) and isinstance(policy.get("fallback_providers"), list):
+            fallback_providers = list(policy["fallback_providers"])
+
     jobs_dir = run_dir / JOBS_DIR
     jobs_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = jobs_dir / f"{job_id}.jsonl"
@@ -3436,13 +3929,14 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         to_harness,
         workdir,
         prompt_text,
-        model=model,
+        model=cli_model,
         session_id=sid,
         session_name=session_name,
         sandbox=args.sandbox,
         last_msg_file=last_msg_file,
         sync=sync_mode,
         reasoning_effort=reasoning_effort,
+        claude_settings_file=str(runtime_info.get("settings_file") or ""),
     )
 
     use_tmux = _should_use_tmux(getattr(args, "tmux", None)) if not args.dry_run else bool(
@@ -3474,7 +3968,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         terminal_reason="",
         extra={
             "target": to_harness,
-            "model": model,
+            "model": display_model,
+            "provider": (provider_summary or {}).get("name") or "",
             "reasoning_effort": reasoning_effort,
             "ultracode": use_ultracode,
             "workdir": str(workdir),
@@ -3506,7 +4001,9 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "tmux": use_tmux,
             "tmux_session": tmux_sess if use_tmux else "",
             "tmux_window_name": win_name if use_tmux else "",
-            "model": model,
+            "model": display_model,
+            "provider": provider_summary,
+            "fallback_providers": fallback_providers,
             "reasoning_effort": reasoning_effort,
             "ultracode": use_ultracode,
             "sync": sync_mode,
@@ -3543,234 +4040,81 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             )
             return 0
 
-    env_overrides = {
-        "HARNESS_LOOP_DEPTH": next_env["HARNESS_LOOP_DEPTH"],
-        "AGY_LOOP_DEPTH": next_env["AGY_LOOP_DEPTH"],
-    }
-
-    if to_harness == "claude" and not sync_mode:
-        dispatch_ts = round(time.time(), 3)
-        proc = subprocess.run(
-            argv,
-            cwd=str(workdir),
-            env=next_env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+    if not sync_mode:
+        spawned = _spawn_worker_job(
+            repo=repo,
+            run_dir=run_dir,
+            manifest=manifest,
+            next_env=next_env,
+            to_harness=to_harness,
+            workdir=workdir,
+            branch=branch,
+            job_id=job_id,
+            wave=wave,
+            track=track,
+            label=label,
+            win_name=win_name,
+            role_name=args.role_name,
+            cli_model=cli_model,
+            display_model=display_model,
+            reasoning_effort=reasoning_effort,
+            sid=sid,
+            session_name=session_name,
+            prompt_text=prompt_text,
+            prompt_file=prompt_file,
+            sandbox=args.sandbox,
+            use_ultracode=use_ultracode,
+            use_tmux=use_tmux,
+            tmux_sess=tmux_sess,
+            provider_summary=provider_summary,
+            runtime_info=runtime_info,
+            fallback_providers=fallback_providers,
+            extra_job_fields={
+                "recovery_mode": (getattr(args, "recovery_mode", "") or "").strip().lower(),
+                "failover_count": 0,
+                "tried_providers": [provider_summary["id"]] if provider_summary else [],
+            },
         )
-        stdout = proc.stdout.strip()
-        if proc.returncode != 0:
-            print(json.dumps({"ok": False, "dispatched": False, "returncode": proc.returncode, "stderr": proc.stderr.strip(), "stdout": stdout}, ensure_ascii=False, indent=2))
-            return 1
-        m = re.search(r"\b([0-9a-f]{8})\b", stdout)
-        bg_id = m.group(1) if m else ""
-        time.sleep(1.5)
-        agents = query_claude_agents(workdir)
-        matched = next((a for a in agents if (bg_id and a.get("id") == bg_id) or a.get("name") == session_name), None)
-        final_sid = (matched.get("sessionId") if matched else None) or sid
-        matched_bg = (matched.get("id") if matched else None) or bg_id
-        matched_name = (matched.get("name") if matched else None) or session_name
-        matched_kind = (matched.get("kind") if matched else None) or "background"
-        jsonl = find_cc_jsonl(workdir, final_sid or matched_bg or None)
-        if not final_sid and jsonl:
-            final_sid = jsonl.stem
-
-        resume_hint = f'cd "{workdir}" && claude --resume {final_sid}' if final_sid else (f"claude attach {matched_bg}" if matched_bg else "")
-        tmux_info: dict[str, Any] = {}
-        attach_target = matched_bg or final_sid
-        if use_tmux and attach_target:
-            spec_payload = {
-                "job_id": job_id,
-                "wave": wave or "-",
-                "label": label or win_name,
-                "harness": "claude",
-                "model": model,
-                "mode": "write",
-                "workdir": str(workdir),
-                "branch": branch,
-                "attach_bg_id": attach_target,
-                "prompt_file": str(prompt_file),
-                "resume_hint": resume_hint,
-                "env_overrides": env_overrides,
-            }
-            _atomic_write_text(spec_file, json.dumps(spec_payload, ensure_ascii=False, indent=2))
-            tmux_info = _launch_in_tmux(
-                tmux_sess,
-                repo,
-                spec_path=spec_file,
-                win_name=win_name,
-                workdir=workdir,
-                pid_file=None,
-                wait_for_child_pid=False,
+        if not spawned.get("ok"):
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "dispatched": False,
+                        "returncode": spawned.get("returncode", 1),
+                        "stderr": spawned.get("stderr", ""),
+                        "stdout": spawned.get("stdout", ""),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
             )
-
-        job_meta = {
-            "job_id": job_id,
-            "wave": wave,
-            "label": label or win_name,
-            "track": track,
-            "harness": "claude",
-            "role_name": args.role_name,
-            "mode": "write",
-            "workdir": str(workdir),
-            "branch": branch,
-            "pid": 0,
-            "bg_id": matched_bg,
-            "attach_bg_id": attach_target,
-            "session_id": final_sid,
-            "name": matched_name,
-            "kind": matched_kind,
-            "model": model,
-            "stdout_jsonl": str(jsonl) if jsonl else "",
-            "prompt_file": str(prompt_file),
-            "tmux_session": tmux_info.get("tmux_session", ""),
-            "tmux_window_index": tmux_info.get("tmux_window_index"),
-            "tmux_window_id": tmux_info.get("tmux_window_id", ""),
-            "tmux_window_name": tmux_info.get("tmux_window_name", ""),
-            "tmux_pane_id": tmux_info.get("tmux_pane_id", ""),
-            "tmux_pane_pid": tmux_info.get("tmux_pane_pid", 0),
-            "tmux_target": tmux_info.get("tmux_target", ""),
-            "status": "RUNNING",
-            "started_at": now_iso(),
-        }
-        updated_manifest = _record_job_in_manifest(
-            repo,
-            run_dir,
-            job_meta,
-            harness="claude",
-            session_id=final_sid,
-            model=model,
-            bg_id=matched_bg,
-            name=matched_name,
-            kind=matched_kind,
-            log_path=str(jsonl) if jsonl else "",
-            dispatch_ts=dispatch_ts,
-            tmux_sess=tmux_info.get("tmux_session", ""),
-        )
+            return 1
+        job_meta = spawned["job_meta"]
+        updated_manifest = spawned["updated_manifest"]
+        tmux_info = spawned["tmux_info"]
         out: dict[str, Any] = {
             "ok": True,
             "dispatched": True,
             "background": True,
-            "harness": "claude",
+            "harness": to_harness,
             "job_id": job_id,
             "rework": is_rework,
             "round": next_round,
             "job": job_meta,
             "workdir": str(workdir),
             "branch": branch,
-            "model": model,
+            "model": display_model,
+            "provider": provider_summary,
+            "fallback_providers": fallback_providers,
             "ultracode": use_ultracode,
-            "bg_id": matched_bg,
-            "session_id": final_sid,
-            "commands": format_cc_commands(updated_manifest),
             "prompt_file": str(prompt_file),
             "dialogue_md": str(run_dir / DIALOGUE_FILE),
         }
-        if tmux_info:
-            out["tmux_session"] = tmux_sess
-            out["tmux_target"] = tmux_info["tmux_target"]
-            out["tmux_attach_cmd"] = f"tmux {sock_flag}attach -t {tmux_sess}"
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0
-
-    if not sync_mode:
-        dispatch_ts = round(time.time(), 3)
-        tmux_info = {}
-        if use_tmux:
-            spec_payload = {
-                "job_id": job_id,
-                "wave": wave or "-",
-                "label": label or win_name,
-                "harness": to_harness,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "mode": "write",
-                "workdir": str(workdir),
-                "branch": branch,
-                "argv": argv,
-                "env_overrides": env_overrides,
-                "prompt_file": str(prompt_file),
-                "stdout_jsonl": str(stdout_log),
-                "last_msg_file": str(last_msg_file),
-                "pid_file": str(pid_file),
-                "exit_file": str(exit_file),
-                "resume_hint": f'cd "{workdir}" && codex resume {sid}' if (to_harness == "codex" and sid) else "",
-            }
-            _atomic_write_text(spec_file, json.dumps(spec_payload, ensure_ascii=False, indent=2))
-            tmux_info = _launch_in_tmux(
-                tmux_sess,
-                repo,
-                spec_path=spec_file,
-                win_name=win_name,
-                workdir=workdir,
-                pid_file=pid_file,
-                wait_for_child_pid=True,
-            )
-            tracked_pid = tmux_info["child_pid"] or tmux_info["tmux_pane_pid"]
-        else:
-            log_fh = stdout_log.open("w", encoding="utf-8")
-            proc = subprocess.Popen(
-                argv,
-                cwd=str(workdir),
-                env=next_env,
-                stdin=subprocess.DEVNULL,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            log_fh.close()
-            tracked_pid = proc.pid
-
-        job_meta = {
-            "job_id": job_id,
-            "wave": wave,
-            "label": label or win_name,
-            "track": track,
-            "harness": to_harness,
-            "role_name": args.role_name,
-            "mode": "write",
-            "workdir": str(workdir),
-            "branch": branch,
-            "pid": tracked_pid,
-            "session_id": sid,
-            "model": model,
-            "stdout_jsonl": str(stdout_log),
-            "last_msg_file": str(last_msg_file),
-            "prompt_file": str(prompt_file),
-            "pid_file": str(pid_file) if use_tmux else "",
-            "exit_file": str(exit_file) if use_tmux else "",
-            "tmux_session": tmux_info.get("tmux_session", ""),
-            "tmux_window_index": tmux_info.get("tmux_window_index"),
-            "tmux_window_id": tmux_info.get("tmux_window_id", ""),
-            "tmux_window_name": tmux_info.get("tmux_window_name", ""),
-            "tmux_pane_id": tmux_info.get("tmux_pane_id", ""),
-            "tmux_pane_pid": tmux_info.get("tmux_pane_pid", 0),
-            "tmux_target": tmux_info.get("tmux_target", ""),
-            "status": "RUNNING",
-            "started_at": now_iso(),
-        }
-        _record_job_in_manifest(
-            repo,
-            run_dir,
-            job_meta,
-            harness=to_harness,
-            session_id=sid,
-            model=model,
-            dispatch_ts=dispatch_ts,
-            tmux_sess=tmux_info.get("tmux_session", ""),
-        )
-        out = {
-            "ok": True,
-            "dispatched": True,
-            "background": True,
-            "harness": to_harness,
-            "job_id": job_id,
-            "rework": is_rework,
-            "round": next_round,
-            "job": job_meta,
-            "dialogue_md": str(run_dir / DIALOGUE_FILE),
-        }
+        if to_harness == "claude":
+            out["bg_id"] = job_meta.get("bg_id", "")
+            out["session_id"] = job_meta.get("session_id", "")
+            out["commands"] = format_cc_commands(updated_manifest)
         if tmux_info:
             out["tmux_session"] = tmux_sess
             out["tmux_target"] = tmux_info["tmux_target"]
@@ -3779,6 +4123,11 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         return 0
 
     # sync_mode
+    env_unset = [str(k) for k in (runtime_info.get("env_unset") or ())]
+    env_overrides = {str(k): str(v) for k, v in (runtime_info.get("env_overrides") or {}).items()}
+    env_overrides["HARNESS_LOOP_DEPTH"] = next_env["HARNESS_LOOP_DEPTH"]
+    env_overrides["AGY_LOOP_DEPTH"] = next_env["AGY_LOOP_DEPTH"]
+    proc_env = _apply_provider_env(next_env, env_unset=env_unset, env_overrides=env_overrides)
     tmux_info = {}
     returncode = 1
     stdout_text = ""
@@ -3789,12 +4138,14 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "wave": wave or "-",
             "label": label or win_name,
             "harness": to_harness,
-            "model": model,
+            "model": display_model,
+            "provider_name": (provider_summary or {}).get("name") or "",
             "reasoning_effort": reasoning_effort,
             "mode": "write",
             "workdir": str(workdir),
             "branch": branch,
             "argv": argv,
+            "env_unset": env_unset,
             "env_overrides": env_overrides,
             "prompt_file": str(prompt_file),
             "stdout_jsonl": str(stdout_log),
@@ -3823,7 +4174,9 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "workdir": str(workdir),
             "branch": branch,
             "pid": tmux_info["child_pid"] or tmux_info["tmux_pane_pid"],
-            "model": model,
+            "model": display_model,
+            "provider_id": (provider_summary or {}).get("id") or "",
+            "provider_name": (provider_summary or {}).get("name") or "",
             "stdout_jsonl": str(stdout_log),
             "last_msg_file": str(last_msg_file),
             "prompt_file": str(prompt_file),
@@ -3838,7 +4191,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "status": "RUNNING",
             "started_at": now_iso(),
         }
-        _record_job_in_manifest(repo, run_dir, job_meta, harness=to_harness, model=model, tmux_sess=tmux_sess)
+        _record_job_in_manifest(repo, run_dir, job_meta, harness=to_harness, model=display_model, tmux_sess=tmux_sess)
         deadline = time.monotonic() + max(int(args.timeout), 1)
         exit_data = None
         while time.monotonic() < deadline:
@@ -3859,7 +4212,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         proc = subprocess.run(
             argv,
             cwd=str(workdir),
-            env=next_env,
+            env=proc_env,
             capture_output=True,
             text=True,
             timeout=args.timeout,
@@ -3869,13 +4222,19 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         stdout_text = proc.stdout
         stderr_text = proc.stderr
 
+    if runtime_info.get("runtime_dir"):
+        try:
+            pf.cleanup_runtime_dir(runtime_info["runtime_dir"])
+        except OSError:
+            pass
+
     reply_text, new_sid = extract_reply_and_session(to_harness, stdout_text, reply_file=last_msg_file)
     final_sid = new_sid or sid
     if returncode != 0:
         if use_tmux:
             job_meta["status"] = "PROCESS_EXITED_FAILED"
             job_meta["session_id"] = final_sid
-            _record_job_in_manifest(repo, run_dir, job_meta, harness=to_harness, session_id=final_sid, model=model, tmux_sess=tmux_sess)
+            _record_job_in_manifest(repo, run_dir, job_meta, harness=to_harness, session_id=final_sid, model=display_model, tmux_sess=tmux_sess)
         err_out = {
             "ok": False,
             "dispatched": True,
@@ -3883,7 +4242,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             "returncode": returncode,
             "harness": to_harness,
             "job_id": job_id,
-            "model": model,
+            "model": display_model,
+            "provider": provider_summary,
             "session_id": final_sid,
             "error_output": reply_text,
             "stderr": stderr_text.strip(),
@@ -3895,11 +4255,11 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     if use_tmux:
         job_meta["status"] = "COMPLETED"
         job_meta["session_id"] = final_sid
-        _record_job_in_manifest(repo, run_dir, job_meta, harness=to_harness, session_id=final_sid, model=model, tmux_sess=tmux_sess)
+        _record_job_in_manifest(repo, run_dir, job_meta, harness=to_harness, session_id=final_sid, model=display_model, tmux_sess=tmux_sess)
     else:
         with _manifest_lock(run_dir):
             manifest = load_manifest(run_dir)
-            _sync_discovered_session(repo, manifest, to_harness, session_id=final_sid, model=model)
+            _sync_discovered_session(repo, manifest, to_harness, session_id=final_sid, model=display_model)
             save_manifest(run_dir, manifest)
     append_event(
         repo,
@@ -3909,7 +4269,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         summary=f"{to_harness} 完成同步派发任务",
         body=reply_text,
         phase="POST_VERIFIER",
-        extra={"model": model, "session_id": final_sid, "job_id": job_id, "workdir": str(workdir)},
+        extra={"model": display_model, "provider": (provider_summary or {}).get("name") or "", "session_id": final_sid, "job_id": job_id, "workdir": str(workdir)},
     )
     out = {
         "ok": True,
@@ -3920,7 +4280,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         "rework": is_rework,
         "round": next_round,
         "workdir": str(workdir),
-        "model": model,
+        "model": display_model,
+        "provider": provider_summary,
         "session_id": final_sid,
         "reply": reply_text,
         "dialogue_md": str(run_dir / DIALOGUE_FILE),
@@ -3929,6 +4290,731 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         out["tmux_target"] = tmux_info.get("tmux_target")
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    """Inspect CC Switch providers, manage run fallback policy, or wipe isolated runtimes."""
+    subcmd = str(getattr(args, "providers_cmd", "") or "")
+    if subcmd == "list":
+        harness_arg = (getattr(args, "harness", "") or "").strip().lower() or None
+        queue_only = bool(getattr(args, "queue_only", False))
+        items = pf.list_cc_switch_providers(harness_arg, queue_only=queue_only)
+        out = {"ok": True, "count": len(items), "providers": items}
+        if args.json:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        else:
+            if not items:
+                print("(未在 CC Switch 中找到匹配的供应商配置)")
+                return 0
+            for it in items:
+                cur_mark = "*" if it.get("is_current") else " "
+                q_mark = "Q" if it.get("in_failover_queue") else "-"
+                print(
+                    f"{cur_mark} [{it['app_type']}] {it['name'] or '-'} "
+                    f"(id={it['id']}, queue={q_mark}, model={it.get('model') or '-'}, url={it.get('base_url') or '-'})"
+                )
+        return 0
+
+    if subcmd == "show":
+        repo = Path(args.repo).resolve()
+        run_dir, manifest = _try_load_run(repo, args.run_id)
+        avail = {h: pf.list_cc_switch_providers(h) for h in ("claude", "codex")}
+        out = {
+            "ok": True,
+            "run_id": manifest.get("run_id") or "",
+            "failover": manifest.get("failover") or {},
+            "available_providers": avail,
+            "dialogue_md": str(run_dir / DIALOGUE_FILE) if run_dir else "",
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+
+    if subcmd == "set-fallback":
+        repo = Path(args.repo).resolve()
+        run_dir = resolve_run_dir(repo, args.run_id)
+        harness = args.harness.strip().lower()
+        primary_obj: dict[str, Any] | None = None
+        if getattr(args, "primary", ""):
+            primary_obj = pf.resolve_provider(harness, args.primary)
+        exclude = [primary_obj["id"]] if primary_obj else []
+        fallbacks = pf.expand_fallback_specs(harness, args.providers, exclude_ids=exclude)
+        if not fallbacks:
+            raise ValueError(f"No usable fallback providers resolved from {args.providers!r}")
+        policy: dict[str, Any] = {
+            "primary": primary_obj,
+            "fallback_providers": fallbacks,
+            "recovery_mode": str(args.recovery_mode or "auto"),
+            "max_failovers": max(int(args.max_failovers), 1),
+            "updated_at": now_iso(),
+        }
+        with _manifest_lock(run_dir):
+            manifest = load_manifest(run_dir)
+            failover_map = manifest.setdefault("failover", {})
+            failover_map[harness] = policy
+            save_manifest(run_dir, manifest)
+            render_dialogue(repo, run_dir)
+        chain_names = " -> ".join(f["name"] or f["id"] for f in fallbacks)
+        append_event(
+            repo,
+            run_dir,
+            role="user",
+            event="roster_set",
+            summary=f"设置 {harness} 备用故障转移队列：{chain_names}",
+            body=json.dumps({"harness": harness, "policy": policy}, ensure_ascii=False, indent=2),
+        )
+        out = {"ok": True, "harness": harness, "policy": policy, "dialogue_md": str(run_dir / DIALOGUE_FILE)}
+        print(json.dumps(out, ensure_ascii=False, indent=2) if args.json else f"[set-fallback:{harness}] {chain_names}")
+        return 0
+
+    if subcmd == "cleanup":
+        clean_all = bool(getattr(args, "all", False))
+        slug = ""
+        if not clean_all:
+            repo = Path(args.repo).resolve()
+            _, manifest = _try_load_run(repo, getattr(args, "run_id", None))
+            slug = str(manifest.get("slug") or repo.name)
+        removed = pf.cleanup_run_runtimes(run_slug=slug, clean_all=clean_all)
+        out = {"ok": True, "removed": removed}
+        print(json.dumps(out, ensure_ascii=False, indent=2) if args.json else f"Cleaned {len(removed)} runtime dirs")
+        return 0
+
+    raise ValueError(f"Unknown providers subcommand: {subcmd!r}")
+
+
+def _stop_job_worker(job: dict[str, Any], harness: str, workdir: Path, sid: str) -> bool:
+    """Stop the old worker cleanly without harming worktree or transcript; returns True if fork needed."""
+    fork_needed = False
+    if harness == "claude":
+        bg_id = str(job.get("bg_id") or job.get("attach_bg_id") or "").strip()
+        if not bg_id and sid:
+            agents = query_claude_agents(workdir)
+            for ag in agents:
+                if ag.get("sessionId") == sid:
+                    if ag.get("kind") == "interactive":
+                        fork_needed = True
+                    elif ag.get("id"):
+                        bg_id = str(ag["id"])
+                    break
+        if bg_id:
+            binary = claude_bin() or "claude"
+            try:
+                subprocess.run([binary, "stop", bg_id], cwd=str(workdir), capture_output=True, text=True, timeout=6, check=False)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            deadline = time.monotonic() + 2.5
+            while time.monotonic() < deadline:
+                agents = query_claude_agents(workdir)
+                hit = next((a for a in agents if a.get("id") == bg_id), None)
+                if not hit or (hit.get("status") != "busy" and hit.get("state") != "running"):
+                    break
+                time.sleep(0.2)
+
+    pid = int(job.get("pid") or 0)
+    if pid > 0 and pid != os.getpid() and is_pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and is_pid_alive(pid):
+            time.sleep(0.15)
+        if is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    tmux_target = str(job.get("tmux_window_id") or job.get("tmux_target") or "").strip()
+    if tmux_bin() and tmux_target:
+        _tmux_run(["kill-window", "-t", tmux_target])
+    return fork_needed
+
+
+def _collect_job_diagnostic_text(job: dict[str, Any] | None, res: dict[str, Any] | None = None) -> str:
+    """Gather failure diagnostics cleanly for Tier-1 resume incompatibility detection."""
+    parts: list[str] = []
+    if res:
+        if isinstance(res.get("last_msg"), dict) and res["last_msg"].get("text"):
+            parts.append(str(res["last_msg"]["text"]))
+        diag = res.get("diagnostic") or {}
+        if isinstance(diag, dict):
+            if diag.get("stdout_tail"):
+                parts.append(str(diag["stdout_tail"]))
+            jsonl_d = diag.get("jsonl") or {}
+            if isinstance(jsonl_d, dict) and isinstance(jsonl_d.get("last_assistant_message"), dict):
+                parts.append(str(jsonl_d["last_assistant_message"].get("text") or ""))
+    if job:
+        parts.append(_read_job_stdout_tail(job, max_lines=40))
+        if job.get("stdout_jsonl"):
+            err_p = Path(str(job["stdout_jsonl"])).with_suffix(".stderr.log")
+            if err_p.exists():
+                try:
+                    parts.append(err_p.read_text(encoding="utf-8", errors="replace")[-1200:])
+                except OSError:
+                    pass
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _probe_tier1_resume(job_meta: dict[str, Any], probe_seconds: float) -> tuple[str, dict[str, Any]]:
+    """Wait briefly after Tier-1 native --resume to catch immediate cross-provider 400/signature failures."""
+    harness = str(job_meta.get("harness") or "")
+    workdir = Path(str(job_meta.get("workdir") or ".")).resolve()
+    sid = str(job_meta.get("session_id") or "")
+    bg_id = str(job_meta.get("bg_id") or "")
+    pid = int(job_meta.get("pid") or 0)
+    min_offset = int(job_meta.get("baseline_log_offset") or 0)
+    baseline_path = str(job_meta.get("baseline_log_path") or "")
+    dispatch_ts = float(job_meta.get("dispatch_ts") or (time.time() - 1.0))
+
+    deadline = time.monotonic() + max(float(probe_seconds), 0.0)
+    last_agent_poll = 0.0
+    ever_alive = is_pid_alive(pid) if pid else False
+
+    while time.monotonic() < deadline:
+        ex = _is_job_exit_recorded(job_meta)
+        if ex is not None:
+            rc = int(ex.get("exit_code", 1))
+            if rc == 0:
+                return "COMPLETED", {"exit_code": 0}
+            err_text = _collect_job_diagnostic_text(job_meta)
+            verdict = "INCOMPATIBLE" if pf.is_resume_incompatible_error(err_text) else "FAILED"
+            return verdict, {"exit_code": rc, "diagnostic_text": err_text}
+
+        if harness in ("codex", "agy") and pid > 0:
+            alive_now = is_pid_alive(pid)
+            if not alive_now:
+                time.sleep(0.15)
+                roll_p = find_codex_rollout(workdir, sid or None) if harness == "codex" else None
+                use_off = min_offset if (roll_p and baseline_path and str(roll_p.resolve()) == str(Path(baseline_path).resolve())) else 0
+                r_info = parse_codex_rollout_tail(roll_p, 4, min_offset=use_off) if (roll_p and roll_p.exists()) else None
+                if not r_info and harness == "codex":
+                    r_info = _synthesize_codex_rollout_from_job(job_meta, sid, dispatch_ts)
+                if r_info and r_info.get("has_task_complete"):
+                    return "COMPLETED", {"rollout": r_info}
+                err_text = _collect_job_diagnostic_text(job_meta)
+                verdict = "INCOMPATIBLE" if pf.is_resume_incompatible_error(err_text) else "FAILED"
+                return verdict, {"diagnostic_text": err_text}
+
+        if harness == "claude":
+            cc_p = Path(str(job_meta.get("stdout_jsonl") or "")) if job_meta.get("stdout_jsonl") else None
+            if not cc_p or not cc_p.exists():
+                cc_p = find_cc_jsonl(workdir, sid or bg_id or None)
+            if cc_p and cc_p.exists():
+                use_off = min_offset if (baseline_path and str(cc_p.resolve()) == str(Path(baseline_path).resolve())) else 0
+                cc_info = parse_cc_jsonl_tail(cc_p, 4, min_offset=use_off)
+                last_msg = cc_info.get("last_assistant_message")
+                if cc_info.get("has_stop_failure"):
+                    raw_tail = "\n".join(_read_tail_lines(cc_p, min_offset=use_off)[-20:])
+                    msg_txt = str((last_msg or {}).get("text") or "")
+                    combined = f"{msg_txt}\n{raw_tail}"
+                    verdict = "INCOMPATIBLE" if pf.is_resume_incompatible_error(combined) else "FAILED"
+                    return verdict, {"jsonl": cc_info, "diagnostic_text": combined}
+                if cc_info.get("last_stop_reason") == "end_turn" and last_msg:
+                    msg_txt = str(last_msg.get("text") or "")
+                    if pf.is_resume_incompatible_error(msg_txt):
+                        return "INCOMPATIBLE", {"jsonl": cc_info, "diagnostic_text": msg_txt}
+                    return "COMPLETED", {"jsonl": cc_info, "last_msg": last_msg}
+            now_m = time.monotonic()
+            if bg_id and (now_m - last_agent_poll) >= 0.4:
+                last_agent_poll = now_m
+                agents = query_claude_agents(workdir)
+                hit = next((a for a in agents if a.get("id") == bg_id), None)
+                if hit and hit.get("state") in ("blocked", "failed"):
+                    err_text = f"{hit.get('error') or ''}\n{_collect_job_diagnostic_text(job_meta)}"
+                    verdict = "INCOMPATIBLE" if pf.is_resume_incompatible_error(err_text) else "FAILED"
+                    return verdict, {"agent_entry": hit, "diagnostic_text": err_text}
+
+        time.sleep(0.15)
+
+    return "OK", {}
+
+
+def _resolve_effective_fallbacks(
+    harness: str,
+    manifest: dict[str, Any],
+    *,
+    job_meta: dict[str, Any] | None = None,
+    cli_fallback: str = "",
+) -> list[dict[str, Any]]:
+    """Resolve ordered fallback providers from CLI flag > job metadata > manifest policy."""
+    if cli_fallback.strip():
+        return pf.expand_fallback_specs(harness, cli_fallback)
+    if job_meta and isinstance(job_meta.get("fallback_providers"), list) and job_meta["fallback_providers"]:
+        return [dict(x) for x in job_meta["fallback_providers"] if isinstance(x, dict) and x.get("id")]
+    policy = (manifest.get("failover") or {}).get(harness)
+    if isinstance(policy, dict) and isinstance(policy.get("fallback_providers"), list):
+        return [dict(x) for x in policy["fallback_providers"] if isinstance(x, dict) and x.get("id")]
+    return []
+
+
+def _select_next_fallback_provider(
+    fallbacks: list[dict[str, Any]],
+    *,
+    tried_ids: set[str],
+    current_id: str = "",
+) -> dict[str, Any] | None:
+    skip = set(tried_ids)
+    if current_id:
+        skip.add(current_id)
+    for item in fallbacks:
+        pid = str(item.get("id") or "")
+        if pid and pid not in skip:
+            return item
+    return None
+
+
+def _execute_failover(
+    *,
+    repo: Path,
+    run_dir: Path,
+    manifest: dict[str, Any],
+    old_job: dict[str, Any] | None,
+    harness: str,
+    workdir: Path,
+    session_id: str,
+    to_provider_spec: str,
+    reason: str,
+    recovery_mode: str = "auto",
+    resume_probe_seconds: float = 4.0,
+    max_failovers: int = DEFAULT_MAX_FAILOVERS,
+    use_tmux: bool = False,
+    tmux_sess: str = "",
+    force: bool = False,
+    dry_run: bool = False,
+    same_provider_downgrade: bool = False,
+    cli_fallback: str = "",
+    extra_diagnostic_tail: str = "",
+) -> dict[str, Any]:
+    """Execute CC Switch provider switch + Two-Tier session checkpoint recovery."""
+    ok_depth, depth, next_env = check_recursion_depth(False)
+    if not ok_depth:
+        return {"ok": False, "reason": "max_recursion_depth", "depth": depth}
+
+    old_job_id = str((old_job or {}).get("job_id") or f"session-{harness}-{(session_id or 'adhoc')[:8]}")
+    old_prov_id = str((old_job or {}).get("provider_id") or "")
+    old_prov_name = str((old_job or {}).get("provider_name") or "")
+    if not old_prov_name:
+        try:
+            all_provs = pf.list_cc_switch_providers(harness)
+            cur_p = next((p for p in all_provs if p.get("is_current")), None)
+            if cur_p:
+                old_prov_id = old_prov_id or str(cur_p.get("id") or "")
+                old_prov_name = str(cur_p.get("name") or "")
+        except Exception:
+            pass
+
+    tried_list = [str(x) for x in ((old_job or {}).get("tried_providers") or []) if str(x)]
+    if old_prov_id and old_prov_id not in tried_list:
+        tried_list.append(old_prov_id)
+
+    failover_count = int((old_job or {}).get("failover_count") or 0)
+    if not same_provider_downgrade and failover_count >= max_failovers and not force:
+        return {
+            "ok": False,
+            "reason": "max_failovers_reached",
+            "failover_count": failover_count,
+            "max_failovers": max_failovers,
+            "old_job_id": old_job_id,
+        }
+
+    fallbacks = _resolve_effective_fallbacks(harness, manifest, job_meta=old_job, cli_fallback=cli_fallback)
+    if to_provider_spec.strip():
+        target_provider = pf.resolve_provider(harness, to_provider_spec)
+    else:
+        target_provider = _select_next_fallback_provider(
+            fallbacks, tried_ids=set(tried_list), current_id=old_prov_id
+        )
+        if not target_provider:
+            return {
+                "ok": False,
+                "reason": "no_fallback_provider_available",
+                "old_job_id": old_job_id,
+                "tried_providers": tried_list,
+            }
+
+    effective_sid = session_id or str((old_job or {}).get("session_id") or "")
+    if not effective_sid and old_job and old_job.get("stdout_jsonl"):
+        jl = Path(str(old_job["stdout_jsonl"]))
+        if jl.exists():
+            _, extracted_sid = extract_reply_and_session(harness, jl.read_text(encoding="utf-8", errors="replace"))
+            if extracted_sid:
+                effective_sid = extracted_sid
+    if not effective_sid and old_job:
+        d_sid, _, _ = _discover_fresh_log(
+            harness,
+            workdir,
+            "",
+            float(old_job.get("dispatch_ts") or 0.0),
+            latest_job=old_job,
+            bg_id=str(old_job.get("bg_id") or ""),
+        )
+        if d_sid:
+            effective_sid = d_sid
+    if not effective_sid and manifest.get("sessions", {}).get(harness, {}).get("session_id"):
+        effective_sid = str(manifest["sessions"][harness]["session_id"])
+
+    # Gather recent turns & stdout tail for zero-token checkpoint before modifying files
+    recent_turns: list[dict[str, Any]] = []
+    last_stop_reason = ""
+    if harness == "claude":
+        cc_p = Path(str((old_job or {}).get("stdout_jsonl") or "")) if (old_job and old_job.get("stdout_jsonl")) else find_cc_jsonl(workdir, effective_sid or None)
+        if cc_p and cc_p.exists():
+            cc_info = parse_cc_jsonl_tail(cc_p, 6)
+            recent_turns = list(cc_info.get("recent_turns") or [])
+            last_stop_reason = str(cc_info.get("last_stop_reason") or "")
+    elif harness == "codex":
+        roll_p = find_codex_rollout(workdir, effective_sid or None)
+        if roll_p and roll_p.exists():
+            r_info = parse_codex_rollout_tail(roll_p, 6)
+            recent_turns = list(r_info.get("recent_turns") or [])
+            last_stop_reason = "turn_aborted" if r_info.get("has_aborted") else ("task_complete" if r_info.get("has_task_complete") else "")
+
+    stdout_tail = extra_diagnostic_tail or _collect_job_diagnostic_text(old_job)
+    orig_prompt_file = str((old_job or {}).get("prompt_file") or "")
+    branch = str((old_job or {}).get("branch") or resolve_worktree_branch(workdir))
+    base_commit = str(manifest.get("base_commit") or git_head_short(workdir))
+
+    cp_payload = pf.build_session_checkpoint(
+        job_id=old_job_id,
+        harness=harness,
+        workdir=workdir,
+        branch=branch,
+        base_commit=base_commit,
+        session_id=effective_sid,
+        from_provider=old_prov_name or old_prov_id or "当前默认配置",
+        to_provider=target_provider,
+        reason=reason,
+        original_prompt_file=orig_prompt_file,
+        recent_turns=recent_turns,
+        last_stop_reason=last_stop_reason,
+        stdout_tail=stdout_tail,
+    )
+    cp_md_text = pf.render_checkpoint_markdown(cp_payload)
+    checkpoint_md_path = run_dir / f"CHECKPOINT-{old_job_id}.md"
+    checkpoint_json_path = run_dir / JOBS_DIR / f"{old_job_id}.checkpoint.json"
+    if not dry_run:
+        _atomic_write_text(checkpoint_md_path, cp_md_text)
+        checkpoint_json_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(checkpoint_json_path, json.dumps(cp_payload, ensure_ascii=False, indent=2) + "\n")
+
+    norm_mode = (recovery_mode or "auto").strip().lower()
+    if norm_mode == "resume" and not effective_sid:
+        return {"ok": False, "reason": "missing_session_id_for_resume", "old_job_id": old_job_id}
+    want_tier1 = norm_mode in ("auto", "resume") and bool(effective_sid)
+
+    ts_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+    rand4 = secrets.token_hex(2)
+    wave = str((old_job or {}).get("wave") or "")
+    track = str((old_job or {}).get("track") or "")
+    label = str((old_job or {}).get("label") or f"fo-{harness}")
+    role_name = str((old_job or {}).get("role_name") or "executor")
+    label_slug = sanitize_tmux_name(label or track or role_name, max_len=14)
+    win_name = sanitize_tmux_name(label or track or f"{harness}-{role_name}", max_len=18)
+    slug = str(manifest.get("slug") or repo.name)
+    reasoning_effort = str((old_job or {}).get("reasoning_effort") or "")
+    new_failover_count = failover_count if same_provider_downgrade else (failover_count + 1)
+    next_tried = list(tried_list)
+    if target_provider["id"] not in next_tried:
+        next_tried.append(target_provider["id"])
+
+    if dry_run:
+        tier_label = "native_resume" if want_tier1 else "checkpoint_handoff"
+        preview_job_id = f"{harness}-{label_slug}-{ts_tag}-{rand4}"
+        rt_preview = pf.materialize_provider_runtime(harness, target_provider["id"], slug, preview_job_id, workdir, dry_run=True)
+        prompt_preview = pf.render_native_resume_prompt(cp_payload, checkpoint_md_path) if want_tier1 else cp_md_text
+        argv_preview = build_delegate_argv(
+            harness,
+            workdir,
+            prompt_preview,
+            model="",
+            session_id=effective_sid if want_tier1 else "",
+            session_name=f"{slug}: {label}",
+            last_msg_file=run_dir / JOBS_DIR / f"{preview_job_id}-last.md",
+            sync=False,
+            reasoning_effort=reasoning_effort,
+            claude_settings_file=str(rt_preview.get("settings_file") or ""),
+        )
+        return {
+            "ok": True,
+            "dry_run": True,
+            "old_job_id": old_job_id,
+            "from_provider": old_prov_name or old_prov_id,
+            "to_provider": target_provider,
+            "recovery_mode": tier_label,
+            "checkpoint_md": str(checkpoint_md_path),
+            "checkpoint_json": str(checkpoint_json_path),
+            "argv": argv_preview,
+        }
+
+    # Stop old job & capture exact log offset before starting replacement
+    fork_needed = _stop_job_worker(old_job or {}, harness, workdir, effective_sid) if old_job else False
+    baseline_log_path, baseline_log_offset = _extract_job_log_offset(harness, workdir, effective_sid, old_job)
+
+    if old_job and old_job.get("job_id"):
+        with _manifest_lock(run_dir):
+            cur_m = load_manifest(run_dir)
+            for j in cur_m.get("jobs") or []:
+                if isinstance(j, dict) and j.get("job_id") == old_job["job_id"]:
+                    j["status"] = "FAILOVER_SWITCHED"
+                    j["finished_at"] = j.get("finished_at") or now_iso()
+                    j["checkpoint_file"] = str(checkpoint_md_path)
+                    j["failover_reason"] = reason
+                    break
+            save_manifest(run_dir, cur_m)
+            render_dialogue(repo, run_dir)
+        if old_job.get("runtime_dir"):
+            try:
+                pf.cleanup_runtime_dir(old_job["runtime_dir"])
+            except OSError:
+                pass
+
+    resolved_tmux_sess = tmux_sess or default_tmux_session_name(manifest, repo)
+    fallback_for_new = fallbacks if fallbacks else _resolve_effective_fallbacks(harness, manifest, job_meta=old_job, cli_fallback=cli_fallback)
+
+    def _launch_mode(mode_kind: str, suffix: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
+        jid = f"{harness}-{label_slug}-{ts_tag}-{rand4}{suffix}"
+        rt = pf.materialize_provider_runtime(harness, target_provider["id"], slug, jid, workdir, dry_run=False)
+        use_sid = effective_sid if mode_kind == "native_resume" else ""
+        p_text = pf.render_native_resume_prompt(cp_payload, checkpoint_md_path) if use_sid else cp_md_text
+        p_file = run_dir / f"FAILOVER-{jid}.md"
+        _atomic_write_text(p_file, p_text)
+        extra_fields: dict[str, Any] = {
+            "resumed_from_job_id": old_job_id,
+            "failover_from": old_job_id,
+            "failover_reason": reason,
+            "failover_count": new_failover_count,
+            "tried_providers": list(next_tried),
+            "checkpoint_file": str(checkpoint_md_path),
+            "recovery_mode": mode_kind,
+            "same_provider_downgraded": same_provider_downgrade or bool(suffix),
+            "baseline_log_path": baseline_log_path if use_sid else "",
+            "baseline_log_offset": baseline_log_offset if use_sid else 0,
+            "fast_test": bool(os.environ.get(pf.CC_SWITCH_DB_ENV)),
+        }
+        sp = _spawn_worker_job(
+            repo=repo,
+            run_dir=run_dir,
+            manifest=load_manifest(run_dir),
+            next_env=next_env,
+            to_harness=harness,
+            workdir=workdir,
+            branch=branch,
+            job_id=jid,
+            wave=wave,
+            track=track,
+            label=label,
+            win_name=win_name,
+            role_name=role_name,
+            cli_model="",
+            display_model=str(target_provider.get("model") or ""),
+            reasoning_effort=reasoning_effort,
+            sid=use_sid,
+            session_name=f"{slug}: {label}",
+            prompt_text=p_text,
+            prompt_file=p_file,
+            sandbox="workspace-write",
+            use_ultracode=False,
+            use_tmux=use_tmux,
+            tmux_sess=resolved_tmux_sess,
+            provider_summary=target_provider,
+            runtime_info=rt,
+            fallback_providers=fallback_for_new,
+            fork_session=fork_needed if use_sid else False,
+            extra_job_fields=extra_fields,
+        )
+        return sp, rt
+
+    downgraded = False
+    mode_used = "native_resume" if want_tier1 else "checkpoint_handoff"
+    spawned, rt_used = _launch_mode(mode_used)
+
+    if mode_used == "native_resume":
+        tier1_failed_reason = ""
+        if not spawned.get("ok"):
+            err_msg = f"{spawned.get('stderr') or ''}\n{spawned.get('stdout') or ''}"
+            if norm_mode == "auto" and (pf.is_resume_incompatible_error(err_msg) or "resume" in err_msg.lower() or "session" in err_msg.lower()):
+                tier1_failed_reason = err_msg.strip()
+            else:
+                if rt_used.get("runtime_dir"):
+                    pf.cleanup_runtime_dir(rt_used["runtime_dir"])
+                return {
+                    "ok": False,
+                    "reason": "failover_spawn_failed",
+                    "error": err_msg.strip(),
+                    "old_job_id": old_job_id,
+                    "to_provider": target_provider,
+                    "checkpoint_md": str(checkpoint_md_path),
+                }
+        elif norm_mode == "auto" and resume_probe_seconds > 0:
+            probe_verdict, probe_info = _probe_tier1_resume(spawned["job_meta"], resume_probe_seconds)
+            if probe_verdict == "INCOMPATIBLE":
+                tier1_failed_reason = str(probe_info.get("diagnostic_text") or "Tier-1 native resume incompatible")
+                _stop_job_worker(spawned["job_meta"], harness, workdir, effective_sid)
+                with _manifest_lock(run_dir):
+                    cur_m = load_manifest(run_dir)
+                    for j in cur_m.get("jobs") or []:
+                        if isinstance(j, dict) and j.get("job_id") == spawned["job_meta"]["job_id"]:
+                            j["status"] = "FAILOVER_SWITCHED"
+                            j["finished_at"] = now_iso()
+                            j["failover_reason"] = f"Tier-1 incompatible: {tier1_failed_reason[:200]}"
+                            break
+                    save_manifest(run_dir, cur_m)
+                if rt_used.get("runtime_dir"):
+                    pf.cleanup_runtime_dir(rt_used["runtime_dir"])
+            elif probe_verdict == "FAILED":
+                _update_job_terminal_state(
+                    repo,
+                    run_dir,
+                    spawned["job_meta"]["job_id"],
+                    reason="PROCESS_EXITED_FAILED",
+                    sid=spawned["job_meta"].get("session_id") or "",
+                    log_path=Path(spawned["job_meta"]["stdout_jsonl"]) if spawned["job_meta"].get("stdout_jsonl") else None,
+                    exit_code=probe_info.get("exit_code"),
+                )
+                return {
+                    "ok": False,
+                    "reason": "target_provider_failed",
+                    "diagnostic": probe_info.get("diagnostic_text") or "",
+                    "old_job_id": old_job_id,
+                    "failed_job": spawned["job_meta"],
+                    "to_provider": target_provider,
+                    "checkpoint_md": str(checkpoint_md_path),
+                }
+
+        if tier1_failed_reason:
+            downgraded = True
+            mode_used = "checkpoint_handoff"
+            spawned, rt_used = _launch_mode("checkpoint_handoff", suffix="-cp")
+
+    if not spawned.get("ok"):
+        if rt_used.get("runtime_dir"):
+            pf.cleanup_runtime_dir(rt_used["runtime_dir"])
+        return {
+            "ok": False,
+            "reason": "failover_spawn_failed",
+            "error": f"{spawned.get('stderr') or ''} {spawned.get('stdout') or ''}".strip(),
+            "old_job_id": old_job_id,
+            "to_provider": target_provider,
+            "checkpoint_md": str(checkpoint_md_path),
+        }
+
+    new_job = spawned["job_meta"]
+    mode_desc = "Tier-2 断点交接（Tier-1 兼容失败自动降级）" if downgraded else ("Tier-1 原生续接 (--resume)" if mode_used == "native_resume" else "Tier-2 断点交接")
+    append_event(
+        repo,
+        run_dir,
+        role="user",
+        event="failover",
+        summary=f"{harness} 故障转移：{old_prov_name or old_prov_id or '默认'} → {target_provider['name'] or target_provider['id']}（{mode_desc}）",
+        body=(
+            f"- **原任务**：`{old_job_id}`\n"
+            f"- **新任务**：`{new_job['job_id']}`\n"
+            f"- **恢复方式**：`{mode_used}`" + ("（自动降级）" if downgraded else "") + "\n"
+            f"- **原因**：{reason}\n"
+            f"- **断点快照**：`{checkpoint_md_path}`\n"
+        ),
+        phase="CC_EXECUTING" if harness == "claude" else f"{harness.upper()}_EXECUTING",
+        terminal_reason="",
+        extra={
+            "target": harness,
+            "model": new_job.get("model") or "",
+            "provider": target_provider.get("name") or "",
+            "old_job_id": old_job_id,
+            "job_id": new_job["job_id"],
+            "recovery_mode": mode_used,
+            "checkpoint_md": str(checkpoint_md_path),
+        },
+    )
+    return {
+        "ok": True,
+        "old_job_id": old_job_id,
+        "new_job": new_job,
+        "from_provider": old_prov_name or old_prov_id,
+        "to_provider": target_provider,
+        "recovery_mode": mode_used,
+        "downgraded_from_resume": downgraded,
+        "checkpoint_md": str(checkpoint_md_path),
+        "checkpoint_json": str(checkpoint_json_path),
+        "failover_count": new_failover_count,
+        "tmux_target": (spawned.get("tmux_info") or {}).get("tmux_target") or "",
+        "dialogue_md": str(run_dir / DIALOGUE_FILE),
+    }
+
+
+def cmd_failover(args: argparse.Namespace) -> int:
+    """Switch a running, slow, or failed job to another CC Switch provider with checkpoint recovery."""
+    repo = Path(args.repo).resolve()
+    run_dir = resolve_run_dir(repo, args.run_id)
+    manifest = load_manifest(run_dir)
+
+    job_id_arg = (getattr(args, "job_id", "") or "").strip()
+    old_job: dict[str, Any] | None = None
+    if job_id_arg:
+        old_job = _find_job_in_manifest(manifest, job_id_arg)
+        if not old_job:
+            raise ValueError(f"Job not found: {job_id_arg}")
+        harness = (args.harness or str(old_job.get("harness") or "")).strip().lower()
+    else:
+        harness = (args.harness or "").strip().lower()
+        if not harness:
+            r_spec = (manifest.get("roster") or {}).get("executor")
+            harness = str((r_spec or {}).get("harness") or "")
+        if harness not in HARNESSES:
+            raise ValueError("Specify --job-id <id> or --harness <claude|codex|agy>")
+        matching = [j for j in (manifest.get("jobs") or []) if isinstance(j, dict) and j.get("harness") == harness and j.get("mode") == "write"]
+        if matching:
+            active_hits = [j for j in matching if _summarize_job_status(j) not in TERMINAL_JOB_STATUSES]
+            old_job = active_hits[-1] if active_hits else matching[-1]
+
+    if harness not in HARNESSES:
+        raise ValueError(f"Unsupported harness: {harness!r}")
+
+    workdir = (
+        Path(args.workdir).resolve()
+        if getattr(args, "workdir", "")
+        else Path(str((old_job or {}).get("workdir") or repo)).resolve()
+    )
+    if not workdir.exists():
+        raise FileNotFoundError(f"Workdir not found: {workdir}")
+
+    session_id = (getattr(args, "session_id", "") or "").strip() or str((old_job or {}).get("session_id") or "")
+    use_tmux = _should_use_tmux(getattr(args, "tmux", None)) if not args.dry_run else bool(
+        getattr(args, "tmux", None) if getattr(args, "tmux", None) is not None else tmux_bin()
+    )
+    tmux_sess = _resolve_tmux_session_from_args(manifest, repo, args)
+    policy = (manifest.get("failover") or {}).get(harness) or {}
+    rec_mode = (getattr(args, "recovery_mode", "") or str(policy.get("recovery_mode") or "auto")).strip().lower()
+    max_fo = int(args.max_failovers) if int(getattr(args, "max_failovers", 0) or 0) > 0 else int(policy.get("max_failovers") or DEFAULT_MAX_FAILOVERS)
+
+    res = _execute_failover(
+        repo=repo,
+        run_dir=run_dir,
+        manifest=manifest,
+        old_job=old_job,
+        harness=harness,
+        workdir=workdir,
+        session_id=session_id,
+        to_provider_spec=getattr(args, "to_provider", "") or "",
+        reason=getattr(args, "reason", "") or "手动切换上游并断点恢复",
+        recovery_mode=rec_mode,
+        resume_probe_seconds=float(getattr(args, "resume_probe_seconds", 4.0)),
+        max_failovers=max_fo,
+        use_tmux=use_tmux,
+        tmux_sess=tmux_sess,
+        force=bool(getattr(args, "force", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        cli_fallback=getattr(args, "fallback", "") or "",
+    )
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    else:
+        if res.get("ok"):
+            nj = res.get("new_job") or {}
+            to_p = (res.get("to_provider") or {}).get("name") or "-"
+            print(f"[failover:{res.get('recovery_mode')}] {res.get('old_job_id')} -> {nj.get('job_id', 'dry-run')} ({to_p})")
+        else:
+            print(f"[failover:FAILED] {res.get('reason')}: {res.get('error') or res.get('diagnostic') or ''}", file=sys.stderr)
+    return 0 if res.get("ok") else (2 if res.get("reason") == "max_failovers_reached" else 1)
 
 
 def _try_load_run(repo: Path, run_id: str | None) -> tuple[Path | None, dict[str, Any]]:
@@ -4842,6 +5928,9 @@ def _emit_watch_result(
     as_json: bool = False,
     workdir: Path | None = None,
     job_id: str = "",
+    failover_history: list[dict[str, Any]] | None = None,
+    failover_exhausted: bool = False,
+    checkpoint_file: str = "",
 ) -> int:
     """Format and print standardized watch exit payload."""
     refreshed = load_manifest(run_dir) if run_dir else manifest
@@ -4867,6 +5956,12 @@ def _emit_watch_result(
     }
     if diagnostic:
         payload["diagnostic"] = diagnostic
+    if failover_history:
+        payload["failover_history"] = failover_history
+    if failover_exhausted:
+        payload["failover_exhausted"] = True
+    if checkpoint_file:
+        payload["checkpoint_file"] = checkpoint_file
     if as_json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -4905,6 +6000,8 @@ class _WatchTarget:
         self.ever_saw_pid_alive = is_pid_alive(tracked_pid) if tracked_pid else False
         self.effective_since = effective_since
         self.job_meta = job_meta
+        self.baseline_log_path = str(job_meta.get("baseline_log_path") or "") if job_meta else ""
+        self.baseline_log_offset = int(job_meta.get("baseline_log_offset") or 0) if job_meta else 0
         self.settle_sec = settle_sec
         self.stall_timeout = stall_timeout
 
@@ -4916,11 +6013,21 @@ class _WatchTarget:
         self.last_git_sig = (git_head_short(workdir), tuple(git_status_short(workdir)))
         self.terminal: dict[str, Any] | None = None
 
+    def _log_min_offset(self, path: Path | None) -> int:
+        if not path or self.baseline_log_offset <= 0 or not self.baseline_log_path:
+            return 0
+        try:
+            if str(path.resolve()) == str(Path(self.baseline_log_path).resolve()):
+                return self.baseline_log_offset
+        except OSError:
+            pass
+        return 0
+
     def _extract_job_completion_msg(self, log_path: Path | None) -> tuple[str, Path | None, dict[str, Any] | None]:
         cur_sid = self.sid
         chosen_path = log_path
         if self.harness == "codex":
-            info = parse_codex_rollout_tail(chosen_path, 5) if (chosen_path and chosen_path.exists()) else None
+            info = parse_codex_rollout_tail(chosen_path, 5, min_offset=self._log_min_offset(chosen_path)) if (chosen_path and chosen_path.exists()) else None
             if not info:
                 info = _synthesize_codex_rollout_from_job(self.job_meta, cur_sid, self.effective_since)
                 if info and info.get("rollout_path"):
@@ -4938,7 +6045,7 @@ class _WatchTarget:
                         last_msg = {"role": "codex", "timestamp": now_iso(), "text": txt}
             return cur_sid, chosen_path, last_msg
         if self.harness == "claude":
-            info = parse_cc_jsonl_tail(chosen_path, 5) if (chosen_path and chosen_path.exists()) else None
+            info = parse_cc_jsonl_tail(chosen_path, 5, min_offset=self._log_min_offset(chosen_path)) if (chosen_path and chosen_path.exists()) else None
             if info and info.get("last_assistant_message"):
                 return cur_sid, chosen_path, info["last_assistant_message"]
         if self.job_meta and self.job_meta.get("stdout_jsonl"):
@@ -5015,7 +6122,7 @@ class _WatchTarget:
         cur_event_ts = ""
 
         if self.harness == "codex":
-            rollout_info = parse_codex_rollout_tail(log_path, 5) if (log_path and log_path.exists()) else None
+            rollout_info = parse_codex_rollout_tail(log_path, 5, min_offset=self._log_min_offset(log_path)) if (log_path and log_path.exists()) else None
             if rollout_info:
                 if rollout_info.get("session_id"):
                     self.sid = str(rollout_info["session_id"])
@@ -5041,7 +6148,7 @@ class _WatchTarget:
                     if self.settle_sec > 0:
                         time.sleep(self.settle_sec)
                     refreshed_path = find_codex_rollout(self.workdir, self.sid or None) or log_path
-                    refreshed_info = parse_codex_rollout_tail(refreshed_path, 5) if (refreshed_path and refreshed_path.exists()) else rollout_info
+                    refreshed_info = parse_codex_rollout_tail(refreshed_path, 5, min_offset=self._log_min_offset(refreshed_path)) if (refreshed_path and refreshed_path.exists()) else rollout_info
                     final_msg = refreshed_info.get("last_assistant_message") or last_msg
                     self.terminal = {
                         "reason": "COMPLETED",
@@ -5054,12 +6161,14 @@ class _WatchTarget:
                     }
                     return self.terminal
 
-            if self.tracked_pid and self.ever_saw_pid_alive and not pid_alive:
+            if self.tracked_pid and not pid_alive and (
+                self.ever_saw_pid_alive or (self.job_meta and self.job_meta.get("stdout_jsonl") and not self.job_meta.get("attach_bg_id"))
+            ):
                 flush_wait = min(max(self.settle_sec, 0.5), 2.0)
                 time.sleep(flush_wait)
                 _, flush_path, _ = _discover_fresh_log("codex", self.workdir, self.sid, self.effective_since, latest_job=self.job_meta)
                 flush_path = flush_path or log_path
-                flush_info = parse_codex_rollout_tail(flush_path, 5) if (flush_path and flush_path.exists()) else None
+                flush_info = parse_codex_rollout_tail(flush_path, 5, min_offset=self._log_min_offset(flush_path)) if (flush_path and flush_path.exists()) else None
                 if not flush_info:
                     flush_info = _synthesize_codex_rollout_from_job(self.job_meta, self.sid, self.effective_since)
                     if flush_info and flush_info.get("rollout_path"):
@@ -5091,7 +6200,7 @@ class _WatchTarget:
                 return self.terminal
 
         elif self.harness == "claude":
-            jsonl_info = parse_cc_jsonl_tail(log_path, 5) if (log_path and log_path.exists()) else None
+            jsonl_info = parse_cc_jsonl_tail(log_path, 5, min_offset=self._log_min_offset(log_path)) if (log_path and log_path.exists()) else None
             if jsonl_info:
                 cur_size = int(jsonl_info.get("file_size_bytes") or -1)
                 cur_event_ts = str(jsonl_info.get("last_record_ts") or "")
@@ -5137,7 +6246,7 @@ class _WatchTarget:
                 re_entry, _ = select_repo_agent(re_agents, self.sid or None)
                 re_busy = bool(re_entry and (re_entry.get("status") == "busy" or re_entry.get("state") == "running"))
                 re_path = find_cc_jsonl(self.workdir, self.sid or None) or log_path
-                re_info = parse_cc_jsonl_tail(re_path, 5) if (re_path and re_path.exists()) else jsonl_info
+                re_info = parse_cc_jsonl_tail(re_path, 5, min_offset=self._log_min_offset(re_path)) if (re_path and re_path.exists()) else jsonl_info
                 if not re_busy and re_info.get("last_stop_reason") != "tool_use":
                     final_msg = re_info.get("last_assistant_message") or last_msg
                     self.terminal = {
@@ -5151,14 +6260,16 @@ class _WatchTarget:
                     }
                     return self.terminal
 
-            if self.tracked_pid and self.ever_saw_pid_alive and not pid_alive:
+            if self.tracked_pid and not pid_alive and (
+                self.ever_saw_pid_alive or (self.job_meta and self.job_meta.get("stdout_jsonl") and not self.job_meta.get("attach_bg_id"))
+            ):
                 flush_wait = min(max(self.settle_sec, 0.5), 2.0)
                 time.sleep(flush_wait)
                 f_sid, flush_path, _ = _discover_fresh_log("claude", self.workdir, self.sid, self.effective_since, latest_job=self.job_meta, bg_id=self.bg_id)
                 if f_sid:
                     self.sid = f_sid
                 flush_path = flush_path or log_path
-                flush_info = parse_cc_jsonl_tail(flush_path, 5) if (flush_path and flush_path.exists()) else None
+                flush_info = parse_cc_jsonl_tail(flush_path, 5, min_offset=self._log_min_offset(flush_path)) if (flush_path and flush_path.exists()) else None
                 f_msg = flush_info.get("last_assistant_message") if flush_info else None
                 f_msg_ep = parse_iso_epoch(f_msg.get("timestamp")) if f_msg else 0.0
                 f_rec_ep = parse_iso_epoch(flush_info.get("last_record_ts")) if flush_info else 0.0
@@ -5192,7 +6303,9 @@ class _WatchTarget:
                     cur_event_ts = str(st.st_mtime)
                 except OSError:
                     pass
-            if self.tracked_pid and self.ever_saw_pid_alive and not pid_alive:
+            if self.tracked_pid and not pid_alive and (
+                self.ever_saw_pid_alive or (self.job_meta and self.job_meta.get("stdout_jsonl") and not self.job_meta.get("attach_bg_id"))
+            ):
                 self.terminal = {
                     "reason": "PROCESS_EXITED_FAILED",
                     "exit_code": 1,
@@ -5249,6 +6362,8 @@ def _build_tracker_from_job(repo: Path, manifest: dict[str, Any], job: dict[str,
     started_ep = parse_iso_epoch(str(job.get("started_at") or ""))
     if args.since_epoch > 0:
         effective_since = float(args.since_epoch)
+    elif job.get("dispatch_ts") and (job.get("resumed_from_job_id") or job.get("failover_from")):
+        effective_since = float(job["dispatch_ts"])
     elif started_ep > 0:
         effective_since = started_ep - 2.0
     else:
@@ -5290,10 +6405,142 @@ def _select_wave_jobs(manifest: dict[str, Any], args: argparse.Namespace) -> lis
         return matched
 
     if all_active:
-        terminal_set = {"COMPLETED", "BLOCKED_OR_FAILED", "PROCESS_EXITED_FAILED", "STALLED", "STOPPED"}
+        terminal_set = set(TERMINAL_JOB_STATUSES)
         return [j for j in jobs if _summarize_job_status(j) not in terminal_set]
 
     return []
+
+
+def _attempt_watch_failover(
+    *,
+    repo: Path,
+    run_dir: Path | None,
+    tracker: _WatchTarget,
+    res: dict[str, Any],
+    commits_since_base: list[str],
+    args: argparse.Namespace,
+    failover_history: list[dict[str, Any]],
+) -> tuple[_WatchTarget | None, bool]:
+    """Try Tier-1 same-provider downgrade or next CC Switch fallback provider on failure/stall."""
+    if not getattr(args, "auto_failover", False) or not run_dir:
+        return None, False
+    if res["reason"] not in ("STALLED", "BLOCKED_OR_FAILED", "PROCESS_EXITED_FAILED"):
+        return None, False
+
+    cur_manifest = load_manifest(run_dir)
+    job = tracker.job_meta or {}
+    harness = tracker.harness
+    policy = (cur_manifest.get("failover") or {}).get(harness) or {}
+    rec_mode = (getattr(args, "recovery_mode", "") or str(policy.get("recovery_mode") or "auto")).strip().lower()
+    cli_max = int(getattr(args, "max_failovers", 0) or 0)
+    max_fo = cli_max if cli_max > 0 else int(policy.get("max_failovers") or DEFAULT_MAX_FAILOVERS)
+    probe_sec = float(getattr(args, "resume_probe_seconds", 4.0))
+    cli_fb = getattr(args, "fallback", "") or ""
+    use_tmux = bool(tmux_bin() and job.get("tmux_session"))
+    tmux_sess = str(job.get("tmux_session") or default_tmux_session_name(cur_manifest, repo))
+
+    diag_txt = _collect_job_diagnostic_text(job, res)
+    elapsed_j = time.monotonic() - tracker.start_mono
+    cur_prov_id = str(job.get("provider_id") or "")
+    same_provider_downgrade = bool(
+        job.get("recovery_mode") == "native_resume"
+        and not job.get("same_provider_downgraded")
+        and cur_prov_id
+        and rec_mode == "auto"
+        and (
+            pf.is_resume_incompatible_error(diag_txt)
+            or (elapsed_j <= 30.0 and not commits_since_base and res["reason"] != "STALLED")
+        )
+    )
+
+    if same_provider_downgrade:
+        fo_res = _execute_failover(
+            repo=repo,
+            run_dir=run_dir,
+            manifest=cur_manifest,
+            old_job=job,
+            harness=harness,
+            workdir=tracker.workdir,
+            session_id=res.get("sid") or tracker.sid,
+            to_provider_spec=cur_prov_id,
+            reason=f"Tier-1 resume 不兼容，同上游降级为断点交接 ({res['reason']})",
+            recovery_mode="checkpoint",
+            resume_probe_seconds=0.0,
+            max_failovers=max_fo,
+            use_tmux=use_tmux,
+            tmux_sess=tmux_sess,
+            same_provider_downgrade=True,
+            cli_fallback=cli_fb,
+            extra_diagnostic_tail=diag_txt,
+        )
+    else:
+        fo_res = _execute_failover(
+            repo=repo,
+            run_dir=run_dir,
+            manifest=cur_manifest,
+            old_job=job,
+            harness=harness,
+            workdir=tracker.workdir,
+            session_id=res.get("sid") or tracker.sid,
+            to_provider_spec="",
+            reason=f"watch 自动故障转移 ({res['reason']})",
+            recovery_mode=rec_mode,
+            resume_probe_seconds=probe_sec,
+            max_failovers=max_fo,
+            use_tmux=use_tmux,
+            tmux_sess=tmux_sess,
+            same_provider_downgrade=False,
+            cli_fallback=cli_fb,
+            extra_diagnostic_tail=diag_txt,
+        )
+
+    if not fo_res.get("ok"):
+        failover_history.append(
+            {
+                "ok": False,
+                "old_job_id": tracker.job_id,
+                "reason": fo_res.get("reason") or "failover_failed",
+                "trigger": res["reason"],
+                "checkpoint_md": fo_res.get("checkpoint_md") or "",
+            }
+        )
+        # If target provider failed immediately with non-incompatible error during Tier-1 probe,
+        # continue failover chain on the remaining untried providers once!
+        if fo_res.get("reason") == "target_provider_failed" and fo_res.get("failed_job"):
+            next_tracker = _build_tracker_from_job(repo, load_manifest(run_dir), fo_res["failed_job"], args)
+            fake_res = {"reason": "PROCESS_EXITED_FAILED", "sid": next_tracker.sid, "diagnostic": {"stdout_tail": fo_res.get("diagnostic") or ""}}
+            return _attempt_watch_failover(
+                repo=repo,
+                run_dir=run_dir,
+                tracker=next_tracker,
+                res=fake_res,
+                commits_since_base=commits_since_base,
+                args=args,
+                failover_history=failover_history,
+            )
+        exhausted = fo_res.get("reason") in ("max_failovers_reached", "no_fallback_provider_available")
+        return None, exhausted
+
+    new_job = fo_res["new_job"]
+    failover_history.append(
+        {
+            "ok": True,
+            "old_job_id": tracker.job_id,
+            "new_job_id": new_job["job_id"],
+            "from_provider": fo_res.get("from_provider") or "",
+            "to_provider": (fo_res.get("to_provider") or {}).get("name") or "",
+            "recovery_mode": fo_res.get("recovery_mode") or "",
+            "downgraded_from_resume": bool(fo_res.get("downgraded_from_resume")),
+            "trigger": res["reason"],
+            "checkpoint_md": fo_res.get("checkpoint_md") or "",
+        }
+    )
+    print(
+        f"[watch:failover] {tracker.job_id} -> {new_job['job_id']} ({(fo_res.get('to_provider') or {}).get('name') or '-'}, {fo_res.get('recovery_mode')})",
+        file=sys.stderr,
+    )
+    refreshed = load_manifest(run_dir)
+    return _build_tracker_from_job(repo, refreshed, new_job, args), False
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -5343,10 +6590,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
         trackers = [_build_tracker_from_job(repo, manifest, j, args) for j in wave_jobs]
         wave_start = time.monotonic()
         results_by_id: dict[str, dict[str, Any]] = {}
+        wave_failover_history: list[dict[str, Any]] = []
+        wave_failover_exhausted = False
 
         while True:
             all_done = True
-            for tr in trackers:
+            for idx_t, tr in enumerate(list(trackers)):
                 if tr.job_id in results_by_id:
                     continue
                 res = tr.poll_once()
@@ -5356,6 +6605,23 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
                 elapsed_j = round(time.monotonic() - tr.start_mono, 2)
                 commits_j = _repo_commits(tr.workdir)
+                if res["reason"] != "COMPLETED" and getattr(args, "auto_failover", False):
+                    next_tr, is_exh = _attempt_watch_failover(
+                        repo=repo,
+                        run_dir=run_dir,
+                        tracker=tr,
+                        res=res,
+                        commits_since_base=commits_j,
+                        args=args,
+                        failover_history=wave_failover_history,
+                    )
+                    if next_tr is not None:
+                        trackers[idx_t] = next_tr
+                        all_done = False
+                        continue
+                    if is_exh:
+                        wave_failover_exhausted = True
+
                 _update_job_terminal_state(
                     repo,
                     run_dir,
@@ -5457,6 +6723,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
             "tmux_attach_cmd": f"tmux {sock_flag}attach -t {sess}",
             "dialogue_md": str(run_dir / DIALOGUE_FILE) if run_dir else "",
         }
+        if wave_failover_history:
+            summary_out["failover_history"] = wave_failover_history
+        if wave_failover_exhausted:
+            summary_out["failover_exhausted"] = True
         if args.json:
             print(json.dumps(summary_out, ensure_ascii=False, indent=2))
         else:
@@ -5475,6 +6745,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         workdir = Path(args.workdir).resolve() if getattr(args, "workdir", "") else Path(str(latest_job.get("workdir") or repo)).resolve()
         if args.since_epoch > 0:
             effective_since = float(args.since_epoch)
+        elif latest_job.get("dispatch_ts") and (latest_job.get("resumed_from_job_id") or latest_job.get("failover_from")):
+            effective_since = float(latest_job["dispatch_ts"])
         else:
             st_ep = parse_iso_epoch(str(latest_job.get("started_at") or ""))
             effective_since = (st_ep - 2.0) if st_ep > 0 else (time.time() - 1.0)
@@ -5521,10 +6793,31 @@ def cmd_watch(args: argparse.Namespace) -> int:
         stall_timeout=int(args.stall_timeout),
     )
 
+    failover_history: list[dict[str, Any]] = []
+    failover_exhausted = False
+    single_start_mono = tracker.start_mono
+
     while True:
         res = tracker.poll_once()
         if res is not None:
             commits_since_base = _repo_commits(workdir)
+            if res["reason"] != "COMPLETED" and getattr(args, "auto_failover", False):
+                next_tracker, is_exh = _attempt_watch_failover(
+                    repo=repo,
+                    run_dir=run_dir,
+                    tracker=tracker,
+                    res=res,
+                    commits_since_base=commits_since_base,
+                    args=args,
+                    failover_history=failover_history,
+                )
+                if next_tracker is not None:
+                    tracker = next_tracker
+                    latest_job = tracker.job_meta
+                    continue
+                if is_exh:
+                    failover_exhausted = True
+
             if latest_job and latest_job.get("job_id"):
                 _update_job_terminal_state(
                     repo,
@@ -5558,6 +6851,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     workdir=workdir,
                     job_id=tracker.job_id,
                 )
+            cp_file = str((latest_job or {}).get("checkpoint_file") or "")
+            if not cp_file and failover_history:
+                cp_file = str(failover_history[-1].get("checkpoint_md") or "")
             return _emit_watch_result(
                 reason=res["reason"],
                 exit_code=res["exit_code"],
@@ -5566,7 +6862,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 run_dir=run_dir,
                 manifest=manifest,
                 sid=res["sid"],
-                elapsed_sec=time.monotonic() - tracker.start_mono,
+                elapsed_sec=time.monotonic() - single_start_mono,
                 synced=synced,
                 commits_since_base=commits_since_base,
                 last_msg=res["last_msg"],
@@ -5574,6 +6870,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 as_json=bool(args.json),
                 workdir=workdir,
                 job_id=tracker.job_id,
+                failover_history=failover_history,
+                failover_exhausted=failover_exhausted,
+                checkpoint_file=cp_file,
             )
 
         if time.monotonic() >= overall_deadline:
@@ -5620,6 +6919,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "current_head": git_head_short(repo),
         "tmux_session": default_tmux_session_name(manifest, repo),
         "roster": manifest.get("roster"),
+        "failover": manifest.get("failover") or {},
         "sessions": manifest.get("sessions"),
         "jobs": manifest.get("jobs"),
         "agy_conversation_id": manifest.get("agy_conversation_id"),
@@ -5894,6 +7194,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cons.add_argument("--run-id", default=None)
     p_cons.add_argument("--from", dest="from_role", choices=ROLES_WITH_USER, required=True)
     p_cons.add_argument("--to", choices=HARNESSES, required=True)
+    p_cons.add_argument("--provider", default="", help="Optional CC Switch provider selector (ID or name)")
     p_cons.add_argument("--model", default=None)
     p_cons.add_argument(
         "--reasoning-effort",
@@ -5923,6 +7224,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_del.add_argument("--track", default="")
     p_del.add_argument("--wave", default="")
     p_del.add_argument("--label", default="")
+    p_del.add_argument("--provider", default="", help="Optional CC Switch provider selector (ID or name)")
+    p_del.add_argument("--fallback", default="", help="Comma-separated CC Switch fallback providers (supports @queue)")
+    p_del.add_argument("--recovery-mode", choices=RECOVERY_MODES, default="", help="Session recovery mode on failover")
     p_del.add_argument("--model", default=None)
     p_del.add_argument(
         "--reasoning-effort",
@@ -6025,8 +7329,65 @@ def build_parser() -> argparse.ArgumentParser:
     sync_grp = p_watch.add_mutually_exclusive_group()
     sync_grp.add_argument("--sync-ledger", dest="sync_ledger", action="store_true", default=True)
     sync_grp.add_argument("--no-sync-ledger", dest="sync_ledger", action="store_false")
+    p_watch.add_argument("--auto-failover", action="store_true", help="Automatically fail over on stall/failure using fallback queue")
+    p_watch.add_argument("--fallback", default="", help="Override fallback provider chain for auto-failover")
+    p_watch.add_argument("--recovery-mode", choices=RECOVERY_MODES, default="", help="Session recovery mode (auto|resume|checkpoint)")
+    p_watch.add_argument("--max-failovers", type=int, default=0, help="Max provider failovers (default from manifest or 2)")
+    p_watch.add_argument("--resume-probe-seconds", type=float, default=4.0, help="Seconds to probe Tier-1 native resume before auto-downgrade")
     p_watch.add_argument("--json", action="store_true")
     p_watch.set_defaults(func=cmd_watch)
+
+    p_prov = sub.add_parser("providers", help="Inspect CC Switch providers, manage fallback queue, or cleanup runtimes")
+    prov_sub = p_prov.add_subparsers(dest="providers_cmd", required=True)
+
+    p_plist = prov_sub.add_parser("list", help="List CC Switch providers (read-only, zero secrets)")
+    p_plist.add_argument("--harness", choices=HARNESSES, default="")
+    p_plist.add_argument("--queue-only", action="store_true")
+    p_plist.add_argument("--json", action="store_true")
+    p_plist.set_defaults(func=cmd_providers)
+
+    p_pshow = prov_sub.add_parser("show", help="Show run failover policy and available CC Switch providers")
+    p_pshow.add_argument("--repo", default=".")
+    p_pshow.add_argument("--run-id", default=None)
+    p_pshow.add_argument("--json", action="store_true")
+    p_pshow.set_defaults(func=cmd_providers)
+
+    p_pset = prov_sub.add_parser("set-fallback", help="Configure ordered fallback providers in manifest.json")
+    p_pset.add_argument("--repo", default=".")
+    p_pset.add_argument("--run-id", default=None)
+    p_pset.add_argument("--harness", choices=HARNESSES, required=True)
+    p_pset.add_argument("--primary", default="", help="Optional primary provider ID or name")
+    p_pset.add_argument("--providers", required=True, help="Comma-separated CC Switch providers (supports @queue)")
+    p_pset.add_argument("--recovery-mode", choices=RECOVERY_MODES, default="auto")
+    p_pset.add_argument("--max-failovers", type=int, default=DEFAULT_MAX_FAILOVERS)
+    p_pset.add_argument("--json", action="store_true")
+    p_pset.set_defaults(func=cmd_providers)
+
+    p_pclean = prov_sub.add_parser("cleanup", help="Securely remove isolated runtime config directories")
+    p_pclean.add_argument("--repo", default=".")
+    p_pclean.add_argument("--run-id", default=None)
+    p_pclean.add_argument("--all", action="store_true")
+    p_pclean.add_argument("--json", action="store_true")
+    p_pclean.set_defaults(func=cmd_providers)
+
+    p_fo = sub.add_parser("failover", help="Switch a job to another CC Switch provider with checkpoint recovery")
+    p_fo.add_argument("--repo", default=".")
+    p_fo.add_argument("--workdir", default="")
+    p_fo.add_argument("--run-id", default=None)
+    p_fo.add_argument("--job-id", default="")
+    p_fo.add_argument("--harness", choices=HARNESSES, default="")
+    p_fo.add_argument("--session-id", default="")
+    p_fo.add_argument("--to-provider", default="", help="Target CC Switch provider ID or name (defaults to next fallback)")
+    p_fo.add_argument("--fallback", default="", help="Optional fallback chain if --to-provider omitted")
+    p_fo.add_argument("--reason", default="", help="Reason recorded in checkpoint and dialogue ledger")
+    p_fo.add_argument("--recovery-mode", choices=RECOVERY_MODES, default="")
+    p_fo.add_argument("--resume-probe-seconds", type=float, default=4.0)
+    p_fo.add_argument("--max-failovers", type=int, default=0)
+    _add_tmux_args(p_fo)
+    p_fo.add_argument("--force", action="store_true")
+    p_fo.add_argument("--dry-run", action="store_true")
+    p_fo.add_argument("--json", action="store_true")
+    p_fo.set_defaults(func=cmd_failover)
 
     p_tmux = sub.add_parser("tmux", help="Inspect, attach, tail, or stop tmux dashboard and worker windows")
     tmux_sub = p_tmux.add_subparsers(dest="tmux_cmd", required=True)

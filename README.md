@@ -41,6 +41,9 @@ curl -fsSL https://raw.githubusercontent.com/qbu11/harness-loop/main/install.sh 
 6. **清晰闭环终止与返工上限硬门禁（`DONE / ESCALATED / ABORTED`）**
    - `delegate --rework` 默认上限 `2` 轮，超限自动拦截并置 `ESCALATED`；`record --event signoff` 硬校验 `PASS` + 无活跃/失败任务 + `ux_walkthrough` 后才落为 `DONE`，也支持 `escalate` / `abort` 显式停机。
    - 支持 Codex `--reasoning-effort <low|medium|high|xhigh>` 审查分级（常规 `high`、高危 `xhigh`）与两级对抗审校标准，只以可复现高危触发路径阻断放行。
+7. **CC Switch 上游故障转移与两级会话断点恢复**
+   - 直接以只读 SQLite 读取 `~/.cc-switch/cc-switch.db`，支持用户指定备选供应商链（`providers set-fallback`）、运行中嫌慢手动热切（`failover --to-provider ...`）及 `watch --auto-failover` 自动兜底。
+   - 使用隔离 `0600` 运行时（不改全局配置、仓库零密钥），并在原生 `--resume` 跨上游报错时自动降级为确定性 `CHECKPOINT-*.md` 断点续传。
 
 ---
 
@@ -59,10 +62,14 @@ python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py delegate \
 python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py tmux status --repo .
 python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py tmux attach --repo .
 
-# 4. 零 Token 等待整波完成
+# 4. 零 Token 等待整波完成（按需加 --auto-failover 开启故障转移）
 python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py watch --repo . --wave wave1 --json
 
-# 5. 回看任意 Claude / Codex / AGY 会话内容
+# 5. 运行中嫌主线路过慢，手动热切到指定 CC Switch 上游并恢复断点
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py providers list --harness claude
+python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py failover --repo . --job-id <id> --to-provider "<backup>" --json
+
+# 6. 回看任意 Claude / Codex / AGY 会话内容
 python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py view --claude-id <id>
 python3 -B ~/.agents/skills/harness-loop/scripts/loopctl.py view --codex-id <id>
 ```
@@ -79,11 +86,14 @@ harness-loop/
 ├── references/
 │   ├── cross-harness-mesh.md            # 跨端互调、tmux 编排、赛道模型与沙箱边界
 │   ├── doc-pack-templates.md            # 六件套文档骨架 + 3 套执行提示词 + 返工模板
+│   ├── provider-failover.md             # CC Switch 故障转移与两级会话断点恢复手册
 │   └── verifier-and-ux-playbook.md      # tmux/watch 守候 + 四维终审 + 实机用户体验
 └── scripts/
-    ├── loopctl.py                       # 核心引擎（init/delegate/consult/tmux/watch/view/doctor）
+    ├── loopctl.py                       # 核心引擎（init/delegate/consult/providers/failover/watch/view）
+    ├── provider_failover.py             # 只读 CC Switch 读取、0600 隔离运行时与断点快照构建
     ├── audit_commits.py                 # 多里程碑 CUI-First 与门禁审计
-    └── test_loopctl.py                  # 隔离单元测试集（含真实独立 tmux 测试）
+    ├── test_loopctl.py                  # 核心编排隔离单测集
+    └── test_provider_failover.py        # 故障转移与断点恢复隔离单测集
 ```
 
 运行测试与环境自检：

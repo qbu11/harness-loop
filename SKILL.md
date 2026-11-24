@@ -52,9 +52,11 @@ metadata:
 |---|---|---|
 | `loopctl.py init` | 初始化闭环、花名册与赛道 | `--repo <dir> --slug <slug> [--architect/--executor/--verifier] [--track k=h[:m]] [--max-rounds 2] [--tmux-session s] --json` |
 | `loopctl.py set-roster` | 运行中动态改角色/赛道/模型 | `--repo <dir> [--executor ...] [--track k=h[:m]] --json` |
-| `loopctl.py delegate` | **派发写任务（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] [--wave w] [--track t] [--label lbl] [--to h] [--model m] [--reasoning-effort low\|medium\|high\|xhigh] [--rework] [--force] [--tmux\|--no-tmux] --json` |
-| `loopctl.py consult` | **只读跨端评审（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] --from <h> --to <h> [--model m] [--reasoning-effort low\|medium\|high\|xhigh] (--prompt\|--prompt-file) [--no-tmux] --json` |
-| `loopctl.py watch` | **零 Token 守候单任务/整波** | `--repo <dir> (--job-id id \| --wave w \| --jobs id1,id2 \| --all-active \| --harness h) [--stall-timeout 600] --json` |
+| `loopctl.py delegate` | **派发写任务（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] [--wave w] [--track t] [--label lbl] [--to h] [--provider p] [--fallback csv] [--model m] [--reasoning-effort low\|medium\|high\|xhigh] [--rework] [--force] [--tmux\|--no-tmux] --json` |
+| `loopctl.py consult` | **只读跨端评审（默认进 tmux 窗）** | `--repo <dir> [--workdir <wt>] --from <h> --to <h> [--provider p] [--model m] [--reasoning-effort low\|medium\|high\|xhigh] (--prompt\|--prompt-file) [--no-tmux] --json` |
+| `loopctl.py providers` | **查看 CC Switch 上游 / 设备用链 / 清理** | `list [--harness h] [--queue-only] \| show --repo <d> \| set-fallback --harness h --providers csv \| cleanup` |
+| `loopctl.py failover` | **手动/故障热切上游并两级断点恢复** | `--repo <d> (--job-id id \| --harness h) [--to-provider p] [--recovery-mode auto\|resume\|checkpoint] [--reason txt] --json` |
+| `loopctl.py watch` | **零 Token 守候单任务/整波** | `--repo <dir> (--job-id id \| --wave w \| --jobs id1,id2 \| --all-active \| --harness h) [--auto-failover --fallback csv] [--stall-timeout 600] --json` |
 | `loopctl.py tmux` | 看板、接入、抓屏、停止 | `status \| dashboard \| attach [--job-id id] \| tail [--job-id id] [--lines 40] \| stop (--job-id id\|--all)` |
 | `loopctl.py view` | **纯只读回放任意端会话全文** | `[--repo dir] [--target all\|dialogue\|claude\|codex\|agy] [--claude-id id] [--codex-id id] [--agy-id id] [--job-id id] [--last 10] [--full]` |
 | `loopctl.py inspect` | 结构化只读切片 + 同步交卷 | `--harness <agy\|claude\|codex> --repo <dir> [--workdir <wt>] [--job-id id] [--sync-ledger] --json` |
@@ -74,7 +76,8 @@ metadata:
 5. **文档包、并行提示词与验收**：
    - 文档包骨架、三套执行官与对抗审查提示词模板见 [references/doc-pack-templates.md](references/doc-pack-templates.md)；
    - Tmux 监测、四维终审、两级审查标准与实机体验规范见 [references/verifier-and-ux-playbook.md](references/verifier-and-ux-playbook.md)。
-6. **操作安全红线**：禁用 `rm`（清理用 `mv <path> ~/.Trash/`）；Git 用 `rtk git`（若项目约定），不加 AI 署名、未经授权不 `git push`。
+6. **上游故障转移与两级会话断点恢复**：通过 `providers list` 只读查询 CC Switch 配置，`providers set-fallback` / `failover` / `watch --auto-failover` 支持用户指定备用链与中转慢/断热切；先试隔离 `0600` 运行时原生 `--resume`，遇不兼容 400/签名报错自动降级为确定性 `CHECKPOINT-*.md` 断点续传，详见 [references/provider-failover.md](references/provider-failover.md)。
+7. **操作安全红线**：禁用 `rm`（清理用 `mv <path> ~/.Trash/`）；Git 用 `rtk git`（若项目约定），不加 AI 署名、未经授权不 `git push`。
 
 ---
 
